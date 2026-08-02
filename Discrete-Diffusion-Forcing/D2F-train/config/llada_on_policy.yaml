@@ -3,7 +3,7 @@ training_mode: 'llada'
 
 # Model and data path configuration
 paths:
-  model: 'GSAI-ML/LLaDA-8B-Instruct'
+  model: '/home/cw/workspace/Discrete-Diffusion-Forcing-main/LLaDA-8B-Instruct'
   experiment: 'ckpt_llada_instruct_on_policy'
   data:
     bs: 'Lansechen/bs17k_collection_filtered_hard_maxlength600'
@@ -11,8 +11,8 @@ paths:
 
 denoiser:
   encoder:
-    name: 'dream'
-    mask_id: 151666
+    name: 'llada'
+    mask_id: 126336  # LLaDA mask_token_id (from config.json)
 
   decoder:
     wiinit: true
@@ -48,7 +48,7 @@ train:
   logging_dir: 'logs'
   mixed_precision: 'fp16'
   gradient_accumulation_steps: 5
-  report_to: 'wandb'
+  report_to: 'no'  # wandb not installed; set to 'wandb' after `pip install wandb` and login
   block_size: 16
 
   lr: 1e-5

@@ -11,6 +11,25 @@ from typing import Tuple, Optional, Dict
 from utils.util import build_custom_float_attention_mask, shift_logits
 
 
+def _attn_kwargs(is_llada: bool, block_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Build the attention kwarg dict according to the model family.
+
+    LLaDA's forward expects the 4D float block mask as ``attention_bias`` (it is
+    added directly to the SDPA scores), while the Dream model expects it as
+    ``attention_mask``. Detecting the family via ``type(model).__name__`` is
+    unreliable once the model is wrapped by peft / accelerate / deepspeed, so the
+    caller passes ``is_llada`` explicitly.
+    """
+    if is_llada:
+        return {"attention_bias": block_mask}
+    return {"attention_mask": block_mask}
+
+
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying module, peeling off DeepSpeed / DDP wrappers."""
+    return model.module if hasattr(model, "module") else model
+
+
 def student_blockwise_rollout(
     input_ids: torch.Tensor,
     student_model: torch.nn.Module,
@@ -23,6 +42,8 @@ def student_blockwise_rollout(
     top_p: float = 0.95,
     device: Optional[torch.device] = None,
     vocab_size: int = 128000,
+    is_llada: bool = False,
+    shift: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Student model performs on-policy decoding within each block.
@@ -87,35 +108,21 @@ def student_blockwise_rollout(
                 attention_mask = build_custom_float_attention_mask(
                     student_decoded, question_length, block_size, device
                 )
-                
+
                 # Get model predictions
                 with torch.no_grad():
-                    # Use student's forward pass with block-wise causal attention
-                    if hasattr(student_model, 'module'):
-                        outputs = student_model.module(
-                            student_decoded,
-                            attention_mask=attention_mask if 'llada' not in str(type(student_model)).lower() else None,
-                            attention_bias=attention_mask if 'llada' in str(type(student_model)).lower() else None
-                        )
-                    else:
-                        outputs = student_model(
-                            student_decoded,
-                            attention_mask=attention_mask if 'llada' not in str(type(student_model)).lower() else None,
-                            attention_bias=attention_mask if 'llada' in str(type(student_model)).lower() else None
-                        )
-                    
+                    # Use student's forward pass with block-wise causal attention.
+                    # Call the underlying module directly to avoid DDP/DeepSpeed
+                    # wrappers (inference-only, no grad).
+                    outputs = _unwrap(student_model)(
+                        student_decoded, **_attn_kwargs(is_llada, attention_mask)
+                    )
                     logits = outputs.logits
-                
-                # Apply shift if needed (for Dream model)
-                if hasattr(student_model, 'module'):
-                    model_ref = student_model.module
-                else:
-                    model_ref = student_model
-                
-                # Shift logits to align with next token prediction
-                if 'dream' in str(type(model_ref)).lower():
+
+                # Shift logits to align with next token prediction (Dream only).
+                if shift:
                     logits = shift_logits(logits)
-                
+
                 # Get logits for current position
                 current_logits = logits[i:i+1, pos, :]  # [1, vocab_size]
                 
@@ -161,6 +168,8 @@ def teacher_rollout(
     top_p: float = 0.95,
     device: Optional[torch.device] = None,
     vocab_size: int = 128000,
+    is_llada: bool = False,
+    shift: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Teacher model performs rollout based on student's decoded sequence.
@@ -227,34 +236,25 @@ def teacher_rollout(
                     break
                 
                 pos = start + block_masked.nonzero()[0].item()
-                
-                # Use bidirectional attention (no causal mask)
-                # Full attention mask (all positions can attend to all)
-                # Use 2-D mask [L, L] which will be broadcast to all batches and heads
-                attention_mask = torch.zeros(L, L, dtype=torch.float32, device=device)
-                
-                # Get teacher predictions
+
+                # Use bidirectional attention (no causal mask): a 4D all-zero bias
+                # allows every position to attend to every other position. This
+                # matches the teacher reference pass in ``compute_llada_loss``.
+                attention_mask = torch.zeros(1, 1, L, L, dtype=torch.float32, device=device)
+
+                # Get teacher predictions (disable LoRA adapter -> use frozen base weights)
                 with torch.no_grad():
-                    with teacher_model.disable_adapter():  # Disable adapter to use original weights
-                        if hasattr(teacher_model, 'module'):
-                            outputs = teacher_model.module(
-                                teacher_decoded,
-                                attention_mask=attention_mask if 'llada' not in str(type(teacher_model)).lower() else None,
-                                attention_bias=attention_mask if 'llada' in str(type(teacher_model)).lower() else None
-                            )
-                        else:
-                            outputs = teacher_model(
-                                teacher_decoded,
-                                attention_mask=attention_mask if 'llada' not in str(type(teacher_model)).lower() else None,
-                                attention_bias=attention_mask if 'llada' in str(type(teacher_model)).lower() else None
-                            )
-                        
+                    base = _unwrap(teacher_model)
+                    with base.disable_adapter():
+                        outputs = base(
+                            teacher_decoded, **_attn_kwargs(is_llada, attention_mask)
+                        )
                         logits = outputs.logits
-                
-                # Apply shift if needed
-                if 'dream' in str(type(teacher_model)).lower():
+
+                # Apply shift if needed (Dream only)
+                if shift:
                     logits = shift_logits(logits)
-                
+
                 # Get logits for current position
                 current_logits = logits[i:i+1, pos, :]
                 
@@ -297,10 +297,12 @@ def on_policy_distillation_step(
     top_p: float = 0.95,
     device: Optional[torch.device] = None,
     vocab_size: int = 128000,
+    is_llada: bool = False,
+    shift: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
     Perform one step of on-policy distillation.
-    
+
     Args:
         input_ids: Original input tokens [B, L]
         student_model: Student model
@@ -315,7 +317,9 @@ def on_policy_distillation_step(
         top_p: Top-p sampling
         device: Device
         vocab_size: Vocabulary size (default 128000 for D2F)
-    
+        is_llada: Whether the model is a LLaDA model (controls attention kwarg)
+        shift: Whether to shift logits (Dream models predict next-token; LLaDA does not)
+
     Returns:
         Dictionary containing:
             - student_decoded: Student's decoded sequence
@@ -337,8 +341,10 @@ def on_policy_distillation_step(
         top_p=top_p,
         device=device,
         vocab_size=vocab_size,
+        is_llada=is_llada,
+        shift=shift,
     )
-    
+
     # Step 2: Teacher performs rollout based on student's outputs
     teacher_decoded, teacher_log_probs = teacher_rollout(
         student_decoded=student_decoded,
@@ -353,6 +359,8 @@ def on_policy_distillation_step(
         top_p=top_p,
         device=device,
         vocab_size=vocab_size,
+        is_llada=is_llada,
+        shift=shift,
     )
     
     return {

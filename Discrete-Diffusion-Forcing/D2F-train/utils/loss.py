@@ -174,10 +174,26 @@ def compute_on_policy_loss(
     """
     B, L = input_ids.shape
     device = input_ids.device
-    
+
     # Import on_policy_distillation_step lazily to avoid circular imports
     from utils.on_policy_rollout import on_policy_distillation_step
-    
+
+    # Model-family dispatch: LLaDA's forward takes the 4D block mask as
+    # ``attention_bias`` (added to SDPA scores) and uses masked-LM-style
+    # prediction (no logit shift). Dream's forward takes it as
+    # ``attention_mask`` and predicts the next token (shift required).
+    training_mode = config.get('training_mode', 'dream') if config is not None else 'dream'
+    is_llada = (training_mode == 'llada')
+    # LLaDA already predicts the token at each position -> never shift.
+    shift = (not is_llada) and enable_shift
+
+    # Resolve vocab size for the (unused) log-prob buffers allocated in the rollout.
+    try:
+        base = denoiser.get_base_model() if hasattr(denoiser, 'get_base_model') else denoiser
+        rollout_vocab_size = base.config.vocab_size
+    except Exception:
+        rollout_vocab_size = 128000
+
     # Step 1: Perform on-policy rollout (student + teacher)
     rollout_results = on_policy_distillation_step(
         input_ids=input_ids,
@@ -192,49 +208,62 @@ def compute_on_policy_loss(
         temperature=temperature,
         top_p=top_p,
         device=device,
+        vocab_size=rollout_vocab_size,
+        is_llada=is_llada,
+        shift=shift,
     )
-    
+
     student_decoded = rollout_results['student_decoded']
-    teacher_decoded = rollout_results['teacher_decoded']
-    student_log_probs = rollout_results['student_log_probs']
-    teacher_log_probs = rollout_results['teacher_log_probs']
     decoded_positions = rollout_results['decoded_positions']
-    
+
     # Step 2: Compute forward pass for student on its own decoded sequence
-    # (to get gradients for training)
+    # (to get gradients for training). Pass the 4D block mask through the
+    # kwarg expected by the model family.
     attention_mask_student = build_custom_float_attention_mask(
         student_decoded, question_length, block_size, device=device
     )
     attention_mask_student = attention_mask_student.to(torch.float16)
-    
+    student_kwargs = (
+        {"attention_bias": attention_mask_student} if is_llada
+        else {"attention_mask": attention_mask_student}
+    )
+
     # Get student predictions (with gradients)
-    logits_student = denoiser(student_decoded, attention_mask=attention_mask_student).logits
-    if enable_shift:
+    logits_student = denoiser(student_decoded, **student_kwargs).logits
+    if shift:
         logits_student = shift_logits(logits_student)
-    
+
     # Step 3: Compute forward pass for teacher on the student-decoded sequence
-    # Teacher uses full bidirectional attention
+    # Teacher uses full bidirectional attention (4D all-zero bias).
     L = student_decoded.shape[1]
     attention_mask_teacher = torch.zeros(
-        [L, L],
-        dtype=torch.float32, device=device
+        [1, 1, L, L], dtype=torch.float16, device=device
     )
-    
+    teacher_kwargs = (
+        {"attention_bias": attention_mask_teacher} if is_llada
+        else {"attention_mask": attention_mask_teacher}
+    )
+
     with torch.no_grad():
+        # ``disable_adapter`` lives on the PeftModel; under DeepSpeed the engine
+        # forwards the attribute to ``.module``. Match the off-policy path.
         with denoiser.disable_adapter():
-            logits_teacher = denoiser(student_decoded, attention_mask=attention_mask_teacher).logits
-            if enable_shift:
+            logits_teacher = denoiser(student_decoded, **teacher_kwargs).logits
+            if shift:
                 logits_teacher = shift_logits(logits_teacher)
             teacher_probs = F.softmax(logits_teacher, dim=-1)
-    
+
     # Step 4: Compute distillation loss
     # Only compute loss on positions that were decoded by student
-    token_loss = F.cross_entropy(
-        logits_student[decoded_positions],
-        teacher_probs[decoded_positions],
-        reduction='none'
-    )
-    
+    if decoded_positions.any():
+        token_loss = F.cross_entropy(
+            logits_student[decoded_positions],
+            teacher_probs[decoded_positions],
+            reduction='none'
+        )
+    else:
+        token_loss = torch.tensor([], device=device)
+
     # Also compute loss on remaining masked positions (teacher's rollout targets)
     remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
     if remaining_mask.any():
@@ -245,16 +274,16 @@ def compute_on_policy_loss(
             reduction='none'
         )
         token_loss = torch.cat([token_loss, token_loss_remaining])
-    
+
     # Compute mean loss
     loss = token_loss.mean()
-    
+
     losses = {
         'loss': loss,
         'student_decoded_length': decoded_positions.sum().float() / B,
         'teacher_rollout_length': remaining_mask.sum().float() / B,
     }
-    
+
     return losses
 
 
@@ -275,7 +304,13 @@ def compute_loss_by_config(
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
     distillation_mode = config.train.get('distillation_mode', 'off-policy') if hasattr(config, 'train') else 'off-policy'
-    
+
+    # LLaDA's mask token id (from config.json) is 126336; the config file's
+    # ``denoiser.encoder.mask_id`` is only correct for Dream. Mirror the
+    # off-policy ``compute_llada_loss`` which hardcodes 126336.
+    if training_mode == 'llada':
+        mask_id = 126336
+
     # Check if on-policy distillation is requested
     if distillation_mode == 'on-policy':
         student_decode_steps = config.train.get('student_decode_steps', 1)

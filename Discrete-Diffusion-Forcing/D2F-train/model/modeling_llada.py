@@ -1274,7 +1274,16 @@ class LLaDAModel(nn.Module):
                 mask_len = attention_mask.shape[-1]
             elif past_key_values is not None:
                 mask_len = past_key_values[0][0].shape[-2] + seq_len
-            attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
+            attention_bias = attention_bias[:, :, :mask_len, :mask_len]
+            # Cast the bias to the active compute dtype so SDPA's attn_mask dtype
+            # matches q/k/v. Under mixed-precision (fp16) this is fp16; otherwise it
+            # follows the hidden states. Replace -inf with finfo.min to avoid NaNs
+            # in softmax (see note below on `F.scaled_dot_product_attention`).
+            if torch.is_autocast_enabled() and attention_bias.device.type == "cuda":
+                attention_bias = attention_bias.to(torch.get_autocast_gpu_dtype())
+            else:
+                attention_bias = attention_bias.to(x.dtype)
+            ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
             # Add in the masking bias.
             if attention_mask is not None:

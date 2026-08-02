@@ -1,10 +1,42 @@
 from datasets import load_dataset
+import datasets as _hf_datasets
 from torch.utils.data import DataLoader,Dataset
 from peft import PeftModel, PeftConfig, get_peft_model
 # from modelscope.msdatasets import MsDataset
 import torch
 import json
 import re
+import glob
+import os
+
+
+def _load_bs17k_dataset(dataset_path):
+    """Load a bs17k-style dataset, falling back to the local arrow cache.
+
+    ``load_dataset(repo_id)`` requires Hub access to resolve the dataset
+    module. When that is unavailable (offline / air-gapped), fall back to the
+    prepared arrow file under the HF datasets cache so training still works.
+    """
+    try:
+        return load_dataset(dataset_path, split="train")
+    except Exception as e:
+        # dataset_path may be a repo id like "Lansechen/<name>"; the datasets
+        # cache directory uses the last path segment as its name.
+        name = os.path.basename(dataset_path.rstrip("/")) or dataset_path
+        cache_root = os.path.expanduser(
+            os.path.join("~/.cache/huggingface/datasets", name)
+        )
+        arrows = glob.glob(
+            os.path.join(cache_root, "default", "*", "*", f"{name}-train.arrow")
+        )
+        if arrows:
+            print(f"[data] Hub unavailable ({type(e).__name__}); loading cached arrow: {arrows[0]}")
+            # NOTE: use ``datasets.Dataset`` (not torch's ``Dataset`` which is
+            # shadowed below) to read the prepared arrow file directly.
+            return _hf_datasets.Dataset.from_file(arrows[0])
+        raise
+
+
 def extract_answer(text):
     pattern = r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>"
     match = re.search(pattern, text, re.DOTALL)
@@ -94,8 +126,8 @@ def read_bs(config=None):
         dataset_path = config.paths.data.bs
     else:
         dataset_path = "/data1/xck/dllm_block_wx/data/Lansechen/bs17k_collection_filtered_hard_maxlength600"
-    
-    dataset=load_dataset(dataset_path, split="train")
+
+    dataset=_load_bs17k_dataset(dataset_path)
     for item in dataset:
         data.append({"question": item['question'], "answer": item['qwen7b_answer']})
     return data
@@ -107,8 +139,8 @@ def read_bs_easy(config=None):
         dataset_path = config.paths.data.bs_easy
     else:
         dataset_path = "/data1/xck/dllm_block_wx/data/Lansechen/bs17k_collection_filtered_easy_maxlength600"
-    
-    dataset=load_dataset(dataset_path, split="train")
+
+    dataset=_load_bs17k_dataset(dataset_path)
     for item in dataset:
         data.append({"question": item['question'], "answer": item['qwen7b_answer']})
     return data

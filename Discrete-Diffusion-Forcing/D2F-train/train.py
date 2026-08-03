@@ -115,7 +115,12 @@ def main(args):
                 input_ids = batch['data']
                 # print("input_ids",input_ids.dtype)
                 question_length = batch['question_length']
-                
+                # ``length`` = question_length + answer_length (real tokens only);
+                # positions >= length are pure padding added by dynamic padding.
+                # The on-policy loss uses this to exclude padding positions so
+                # the reported loss is consistent across batch sizes / pad len.
+                lengths = batch.get('length', None)
+
                 # Use unified loss function selection
                 losses = compute_loss_by_config(
                     input_ids,
@@ -129,7 +134,8 @@ def main(args):
                     feature_align = config.train.feature_align,
                     self_step     = config.train.self_step,
                     eos_id        = tokenizer.eos_token_id,
-                    config        = config
+                    config        = config,
+                    lengths       = lengths,
                 )
                 
                 if config.train.share_steps > 1:

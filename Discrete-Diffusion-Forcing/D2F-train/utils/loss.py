@@ -143,34 +143,37 @@ def compute_on_policy_loss(
         top_p=0.95,
         config=None
 ):
-    """
-    Compute on-policy distillation loss.
-    
+    """Compute on-policy distillation loss.
+
     In on-policy distillation:
-    1. Student model decodes n steps within each block using block-wise causal attention
-    2. Teacher model performs m-step rollout based on student's decoded sequence (using full bidirectional attention)
-    3. Compute distillation loss between student and teacher outputs
-    
+    1. Student model decodes n steps within each block using block-wise causal
+       attention (batched across blocks — only ``num_decode_steps`` forward
+       passes total).
+    2. A single teacher forward pass (``disable_adapter``) provides the
+       distillation target on the student-decoded sequence.
+    3. Distillation loss on decoded positions + supervised loss on remaining
+       masked positions.
+
     Args:
-        input_ids: Original input tokens [B, L]
-        denoiser: Student model (will also be used as teacher by disabling adapter)
-        question_length: Length of prompt for each sample [B]
-        mask_id: Token ID for mask token
-        block_size: Size of each block
-        enable_shift: Whether to shift logits
-        share_steps: Number of shared steps
-        self_align: Whether to use self-alignment
-        feature_align: Whether to use feature alignment
-        self_step: Whether to use self-step
-        eos_id: End-of-sequence token ID
-        student_decode_steps: Number of steps for student to decode in each block (n)
-        teacher_rollout_steps: Number of steps for teacher to rollout (m)
-        temperature: Sampling temperature
-        top_p: Top-p sampling parameter
-        config: Configuration object
-    
+        input_ids: Original input tokens [B, L].
+        denoiser: Student model (also used as teacher via disable_adapter).
+        question_length: Prompt length per sample [B].
+        mask_id: Mask token ID.
+        block_size: Block size.
+        enable_shift: Whether to shift logits.
+        share_steps: Number of shared steps.
+        self_align: Whether to use self-alignment.
+        feature_align: Whether to use feature alignment.
+        self_step: Whether to use self-step.
+        eos_id: EOS token ID.
+        student_decode_steps: Student decode steps per block.
+        teacher_rollout_steps: (unused — teacher rollout is disabled).
+        temperature: Sampling temperature.
+        top_p: Top-p sampling parameter.
+        config: Configuration object.
+
     Returns:
-        Dictionary containing loss values
+        Dictionary containing loss values.
     """
     B, L = input_ids.shape
     device = input_ids.device
@@ -264,10 +267,10 @@ def compute_on_policy_loss(
     else:
         token_loss = torch.tensor([], device=device)
 
-    # Also compute loss on remaining masked positions (teacher's rollout targets)
+    # Also compute supervised loss on remaining masked positions (positions
+    # the student did not decode — target is the ground-truth token).
     remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
     if remaining_mask.any():
-        # Use original input_ids as targets for remaining positions
         token_loss_remaining = F.cross_entropy(
             logits_student[remaining_mask],
             input_ids[remaining_mask],
@@ -281,7 +284,7 @@ def compute_on_policy_loss(
     losses = {
         'loss': loss,
         'student_decoded_length': decoded_positions.sum().float() / B,
-        'teacher_rollout_length': remaining_mask.sum().float() / B,
+        'remaining_mask_length': remaining_mask.sum().float() / B,
     }
 
     return losses

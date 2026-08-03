@@ -70,5 +70,5 @@ train:
 
 data:
   name: "bs17k"
-  batch_size: 1          # dynamic padding reduces wasted compute even at B=1
+  batch_size: 4          # dynamic padding handles variable-length sequences in a batch
   max_length: *seq_len

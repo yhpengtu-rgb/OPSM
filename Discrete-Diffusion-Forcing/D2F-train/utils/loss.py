@@ -141,7 +141,8 @@ def compute_on_policy_loss(
         teacher_rollout_steps=1,
         temperature=1.0,
         top_p=0.95,
-        config=None
+        config=None,
+        rollout_results=None
 ):
     """Compute on-policy distillation loss.
 
@@ -198,26 +199,35 @@ def compute_on_policy_loss(
         rollout_vocab_size = 128000
 
     # Step 1: Perform on-policy rollout (student + teacher)
-    rollout_results = on_policy_distillation_step(
-        input_ids=input_ids,
-        student_model=denoiser,
-        teacher_model=denoiser,  # Teacher is the same model but with full attention
-        question_length=question_length,
-        block_size=block_size,
-        student_decode_steps=student_decode_steps,
-        teacher_rollout_steps=teacher_rollout_steps,
-        mask_id=mask_id,
-        eos_id=eos_id,
-        temperature=temperature,
-        top_p=top_p,
-        device=device,
-        vocab_size=rollout_vocab_size,
-        is_llada=is_llada,
-        shift=shift,
-    )
+    # If rollout_results are provided externally (async pipeline), skip
+    # the internal rollout call.
+    if rollout_results is not None:
+        student_decoded = rollout_results['student_decoded']
+        decoded_positions = rollout_results['decoded_positions']
+    else:
+        rollout_results = on_policy_distillation_step(
+            input_ids=input_ids,
+            student_model=denoiser,
+            teacher_model=denoiser,
+            question_length=question_length,
+            block_size=block_size,
+            student_decode_steps=student_decode_steps,
+            teacher_rollout_steps=teacher_rollout_steps,
+            mask_id=mask_id,
+            eos_id=eos_id,
+            temperature=temperature,
+            top_p=top_p,
+            device=device,
+            vocab_size=rollout_vocab_size,
+            is_llada=is_llada,
+            shift=shift,
+        )
+        student_decoded = rollout_results['student_decoded']
+        decoded_positions = rollout_results['decoded_positions']
 
-    student_decoded = rollout_results['student_decoded']
-    decoded_positions = rollout_results['decoded_positions']
+    # Free rollout intermediates before the gradient-bearing forward pass
+    del rollout_results
+    torch.cuda.empty_cache()
 
     # Step 2: Compute forward pass for student on its own decoded sequence
     # (to get gradients for training). Pass the 4D block mask through the
@@ -302,7 +312,8 @@ def compute_loss_by_config(
         feature_align,
         self_step,
         eos_id,
-        config
+        config,
+        rollout_results=None
 ):
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
@@ -329,7 +340,8 @@ def compute_loss_by_config(
                 teacher_rollout_steps=teacher_rollout_steps,
                 temperature=temperature,
                 top_p=top_p,
-                config=config
+                config=config,
+                rollout_results=rollout_results
             )
         elif training_mode == 'dream':
             return compute_on_policy_loss(
@@ -339,7 +351,8 @@ def compute_loss_by_config(
                 teacher_rollout_steps=teacher_rollout_steps,
                 temperature=temperature,
                 top_p=top_p,
-                config=config
+                config=config,
+                rollout_results=rollout_results
             )
         else:
             raise ValueError(f"Unsupported training mode: {training_mode}")

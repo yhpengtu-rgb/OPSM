@@ -54,7 +54,7 @@ train:
   output_dir: "ddt_on_policy_merged"
   logging_dir: "logs"
   mixed_precision: "fp16"
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   report_to: "no"
   block_size: 16
   lr: 1e-5
@@ -70,5 +70,5 @@ train:
 
 data:
   name: "bs17k"
-  batch_size: 4          # dynamic padding handles variable-length sequences in a batch
+  batch_size: 1          # dynamic padding + gradient_accumulation for effective bs
   max_length: *seq_len

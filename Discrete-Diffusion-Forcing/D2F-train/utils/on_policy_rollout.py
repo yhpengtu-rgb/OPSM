@@ -146,30 +146,43 @@ def student_blockwise_rollout(
     model = _unwrap(student_model)
 
     # --- Sequential block loop (inter-block causal) -----------------------
+    # Key optimisation: ONE forward pass per (block_idx, step) — not per
+    # sample.  The model forward already processes ALL B samples at once;
+    # we extract each active sample's logits from the single output.
     for block_idx in range(max_blocks):
-        for i in range(B):
-            if block_idx >= total_blocks[i]:
-                continue
+        # Determine which samples have this block
+        active = [i for i in range(B) if block_idx < total_blocks[i]]
+        if not active:
+            continue
 
+        # Compute max steps for this block across active samples
+        max_steps_block = 0
+        block_starts = {}
+        for i in active:
             start = prompt_lens[i] + block_idx * block_size
             end = min(start + block_size, L)
-            steps = min(num_decode_steps, end - start)
+            steps_i = min(num_decode_steps, end - start)
+            block_starts[i] = (start, steps_i)
+            max_steps_block = max(max_steps_block, steps_i)
 
-            for step in range(steps):
-                pos = start + step
+        for step in range(max_steps_block):
+            # ONE forward pass for ALL samples — sees all previously
+            # decoded tokens (inter-block causal + intra-block causal).
+            with torch.no_grad():
+                outputs = model(student_decoded, **attn_kw)
+                logits = outputs.logits
 
-                # Forward pass — sees all previously decoded tokens in
-                # earlier blocks (inter-block causal) and in this block.
-                with torch.no_grad():
-                    outputs = model(student_decoded, **attn_kw)
-                    logits = outputs.logits
+            if shift:
+                logits = shift_logits(logits)
 
-                if shift:
-                    logits = shift_logits(logits)
-
+            # Sample tokens for all active samples at this step
+            for i in active:
+                start_i, steps_i = block_starts[i]
+                if step >= steps_i:
+                    continue
+                pos = start_i + step
                 current_logits = logits[i, pos, :].unsqueeze(0)  # [1, V]
-                sampled = _top_p_sample(current_logits, temperature, top_p)  # [1, 1]
-
+                sampled = _top_p_sample(current_logits, temperature, top_p)
                 student_decoded[i, pos] = sampled.squeeze()
                 decoded_positions[i, pos] = True
 

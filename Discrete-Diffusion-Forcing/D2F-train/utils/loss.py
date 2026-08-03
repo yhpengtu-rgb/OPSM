@@ -219,6 +219,10 @@ def compute_on_policy_loss(
     student_decoded = rollout_results['student_decoded']
     decoded_positions = rollout_results['decoded_positions']
 
+    # Free rollout intermediates before the gradient-bearing forward pass
+    del rollout_results
+    torch.cuda.empty_cache()
+
     # Step 2: Compute forward pass for student on its own decoded sequence
     # (to get gradients for training). Pass the 4D block mask through the
     # kwarg expected by the model family.

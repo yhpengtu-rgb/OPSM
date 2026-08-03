@@ -44,7 +44,7 @@ train:
   teacher_rollout_steps: 1
   temperature: 0.8
   top_p: 0.95
-  async_rollout_device: "cuda:1"   # dedicated rollout GPU; leave empty for sync
+  async_rollout_device:          # blank = sync (recommended; see async test notes)
   decoder_resume_path:
   head_resume_path:
   skipped_keys:
@@ -58,7 +58,7 @@ train:
   report_to: "no"
   block_size: 16
   lr: 1e-5
-  num_iters: 3          # iteration cap (stops mid-epoch once reached)
+  num_iters: 30         # iteration cap (stops mid-epoch once reached)
   num_epochs:           # epoch-based: if set, stops after N full epochs
   eval_every: 100000
   save_every: 100000

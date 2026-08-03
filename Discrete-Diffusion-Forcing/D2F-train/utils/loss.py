@@ -142,7 +142,8 @@ def compute_on_policy_loss(
         temperature=1.0,
         top_p=0.95,
         config=None,
-        rollout_results=None
+        rollout_results=None,
+        lengths=None
 ):
     """Compute on-policy distillation loss.
 
@@ -172,6 +173,12 @@ def compute_on_policy_loss(
         temperature: Sampling temperature.
         top_p: Top-p sampling parameter.
         config: Configuration object.
+        rollout_results: Externally-provided rollout (async pipeline). When not
+            None, the internal rollout call is skipped.
+        lengths: Real-token length per sample [B] (question + answer, excl.
+            pure padding). When provided, positions >= length are excluded
+            from the loss so the reported loss is consistent across batch
+            sizes and padding lengths (dynamic padding). None = no exclusion.
 
     Returns:
         Dictionary containing loss values.
@@ -267,6 +274,19 @@ def compute_on_policy_loss(
             teacher_probs = F.softmax(logits_teacher, dim=-1)
 
     # Step 4: Compute distillation loss
+    # Build a valid-position mask that excludes pure padding (positions >=
+    # ``length``) when ``lengths`` is provided. With dynamic padding the pad
+    # region shrinks/grows per batch; including it would make the mean loss
+    # depend on how much padding a batch happens to carry. Excluding pad
+    # positions yields a loss that is comparable across batch sizes and
+    # padding strategies (only real answer tokens + the closing EOS count).
+    if lengths is not None:
+        token_positions = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+        valid_mask = token_positions < lengths.to(device).unsqueeze(1)  # [B, L]
+        decoded_positions = decoded_positions & valid_mask
+    else:
+        valid_mask = None
+
     # Only compute loss on positions that were decoded by student
     if decoded_positions.any():
         token_loss = F.cross_entropy(
@@ -280,6 +300,8 @@ def compute_on_policy_loss(
     # Also compute supervised loss on remaining masked positions (positions
     # the student did not decode — target is the ground-truth token).
     remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
+    if valid_mask is not None:
+        remaining_mask = remaining_mask & valid_mask
     if remaining_mask.any():
         token_loss_remaining = F.cross_entropy(
             logits_student[remaining_mask],
@@ -313,7 +335,8 @@ def compute_loss_by_config(
         self_step,
         eos_id,
         config,
-        rollout_results=None
+        rollout_results=None,
+        lengths=None
 ):
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
@@ -341,7 +364,8 @@ def compute_loss_by_config(
                 temperature=temperature,
                 top_p=top_p,
                 config=config,
-                rollout_results=rollout_results
+                rollout_results=rollout_results,
+                lengths=lengths,
             )
         elif training_mode == 'dream':
             return compute_on_policy_loss(
@@ -352,7 +376,8 @@ def compute_loss_by_config(
                 temperature=temperature,
                 top_p=top_p,
                 config=config,
-                rollout_results=rollout_results
+                rollout_results=rollout_results,
+                lengths=lengths,
             )
         else:
             raise ValueError(f"Unsupported training mode: {training_mode}")

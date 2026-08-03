@@ -81,8 +81,24 @@ def main(args):
 
     training_done = False
     epoch = 0
+
+    # Epoch-based training: iterate over epochs, each epoch covers the full
+    # dataloader once.  ``num_iters`` (if set) is an iteration cap that stops
+    # training mid-epoch; ``num_epochs`` (if set) stops after N full epochs.
+    # At least one of the two should be set in config.
+    num_iters_cap = config.train.get('num_iters', None)
+    num_epochs = config.train.get('num_epochs', None)
+
+    # Progress bar: prefer num_iters cap if set, else num_epochs * len(dataloader)
+    if num_iters_cap is not None:
+        total_steps = num_iters_cap
+    elif num_epochs is not None:
+        total_steps = num_epochs * len(dataloader)
+    else:
+        total_steps = None
+
     progress_bar = tqdm(
-        total   = config.train.num_iters,
+        total   = total_steps,
         initial = global_step,
         desc    = 'Steps',
         disable = not accelerator.is_local_main_process,
@@ -131,6 +147,11 @@ def main(args):
             denoiser.train()
             input_ids = batch['data']
             question_length = batch['question_length']
+            # ``length`` = question_length + answer_length (real tokens only);
+            # positions >= length are pure padding added by dynamic padding.
+            # The on-policy loss uses this to exclude padding positions so
+            # the reported loss is consistent across batch sizes / pad len.
+            lengths = batch.get('length', None)
 
             # Use unified loss function selection. When the async pipeline
             # supplies ``rollout_results``, the loss fn skips its internal
@@ -149,6 +170,7 @@ def main(args):
                 eos_id        = tokenizer.eos_token_id,
                 config        = config,
                 rollout_results = rollout_results,
+                lengths       = lengths,
             )
 
             if config.train.share_steps > 1:
@@ -239,7 +261,8 @@ def main(args):
             # lmhead_state_dict = accelerator.unwrap_model(denoiser).lm_head.state_dict()
             # torch.save(lmhead_state_dict, os.path.join(output_dir, f"LMhead-{config.train.exp_name}-{global_step // 1000}k"))
         accelerator.wait_for_everyone()
-        if global_step >= config.train.num_iters:
+        # Stop if we've reached the iteration cap (if set)
+        if num_iters_cap is not None and global_step >= num_iters_cap:
             training_done = True
 
     def _payload(batch):
@@ -286,6 +309,9 @@ def main(args):
             train_one_step(pending_batch, rollout_results)
 
         epoch += 1
+        # Stop if we've completed all epochs (if num_epochs is set)
+        if num_epochs is not None and epoch >= num_epochs:
+            training_done = True
         if training_done:
             break
     if async_pipeline is not None:

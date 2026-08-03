@@ -8,6 +8,53 @@ import json
 import re
 import glob
 import os
+import math
+
+
+def collate_fn_dynamic(batch, pad_id, block_size=16):
+    """Dynamic padding collate function.
+
+    Pads sequences to the longest in the batch, rounded up to the nearest
+    multiple of ``block_size``.  This avoids wasting computation on
+    unnecessary padding tokens when batch_size > 1 and sequences have
+    varying lengths.
+
+    Args:
+        batch: list of dicts with keys ``data`` (unpadded 1D tensor),
+               ``question_length`` (int), ``length`` (int).
+        pad_id: token id used for padding.
+        block_size: block size for rounding (ensures seq_len is a multiple
+                    of block_size for clean block-causal partitioning).
+
+    Returns:
+        dict with ``data`` [B, L_padded], ``question_length`` [B],
+        ``length`` [B].
+    """
+    max_len = max(item['length'] for item in batch)
+    # Round up to nearest multiple of block_size
+    if block_size > 1:
+        max_len = math.ceil(max_len / block_size) * block_size
+
+    data_list = []
+    qlen_list = []
+    length_list = []
+    for item in batch:
+        seq = item['data']
+        seq_len = seq.size(0)
+        if seq_len < max_len:
+            padding = torch.full((max_len - seq_len,), pad_id, dtype=seq.dtype)
+            seq = torch.cat([seq, padding])
+        elif seq_len > max_len:
+            seq = seq[:max_len]
+        data_list.append(seq)
+        qlen_list.append(item['question_length'])
+        length_list.append(min(item['length'], max_len))
+
+    return {
+        'data': torch.stack(data_list),
+        'question_length': torch.tensor(qlen_list, dtype=torch.long),
+        'length': torch.tensor(length_list, dtype=torch.long),
+    }
 
 
 def _load_bs17k_dataset(dataset_path):
@@ -280,9 +327,6 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
         question = data['question']
         answer = data['answer']
 
-        # messages = [
-        #     {"role": "user", "content": "Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?"},
-        # ]
         messages = [
             {"role": "user", "content": question}
         ]
@@ -290,7 +334,6 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
             messages, return_tensors="pt", return_dict=True, add_generation_prompt=True
         ).input_ids[0]
 
-        # question = tokenizer(question, return_tensors='pt')['input_ids'][0]
         answer = tokenizer(answer, return_tensors='pt')['input_ids'][0]
         answer = torch.cat((answer, torch.tensor([126348])), dim=-1)
 
@@ -301,22 +344,29 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
         if combined_length > max_length:
             continue
 
-        padding_length = max_length - combined_length
-        padding = torch.full((padding_length,), tokenizer.eos_token_id, dtype=question.dtype)
-        padded_data = torch.cat((question, answer, padding), dim=-1)
+        # Store unpadded data — dynamic padding is applied in collate_fn
+        unpadded_data = torch.cat((question, answer), dim=-1)
 
         train_dataset.append(
             dict(
-                data = padded_data,
+                data = unpadded_data,
                 question_length = question_length,
                 length = combined_length,
             )
         )
 
     dataset = CustomDataset(train_dataset)
+
+    # Resolve block_size from global config for dynamic padding alignment
+    block_size = 16
+    if global_config and hasattr(global_config, 'train') and hasattr(global_config.train, 'block_size'):
+        block_size = global_config.train.block_size
+
+    pad_id = tokenizer.eos_token_id
     dataloader = DataLoader(
         dataset,
         batch_size  = config.batch_size,
+        collate_fn  = lambda x: collate_fn_dynamic(x, pad_id, block_size=block_size),
         num_workers = 0,
         shuffle     = True,
         pin_memory  = True,

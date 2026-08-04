@@ -341,17 +341,30 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
         answer_length = answer.shape[-1]
         combined_length = question_length + answer_length
 
-        if combined_length > max_length:
+        # Skip samples whose question alone fills max_length — after truncation
+        # there would be zero answer tokens, producing empty decoded/remaining
+        # masks in the DMD loss (and a GradScaler "No inf checks" crash).
+        if question_length >= max_length:
             continue
 
-        # Store unpadded data — dynamic padding is applied in collate_fn
-        unpadded_data = torch.cat((question, answer), dim=-1)
+        # Truncate to max_length (prompt kept intact, answer truncated) rather
+        # than filtering.  Filtering at a small max_length would drop almost
+        # the entire dataset (answers are long reasoning traces); truncation
+        # keeps every sample and caps the differentiable DMD rollout at
+        # max_length/block_size block-wise grad forward passes.
+        if combined_length > max_length:
+            unpadded_data = torch.cat((question, answer), dim=-1)[:max_length]
+            length = max_length
+        else:
+            # Store unpadded data — dynamic padding is applied in collate_fn
+            unpadded_data = torch.cat((question, answer), dim=-1)
+            length = combined_length
 
         train_dataset.append(
             dict(
                 data = unpadded_data,
                 question_length = question_length,
-                length = combined_length,
+                length = length,
             )
         )
 

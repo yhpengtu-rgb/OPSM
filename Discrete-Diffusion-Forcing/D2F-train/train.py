@@ -46,7 +46,13 @@ def main(args):
     
     # Use unified model and data loading functions
     denoiser, tokenizer = get_model_by_config(config)
-    dataloader = get_dataloader_by_config(tokenizer, config.data, config)
+    # Pass ``max_length`` from the config so sequences are capped.  Without
+    # this, ``get_dataloader_by_config`` defaults to max_length=1024 and
+    # ignores ``config.data.max_length``, letting sequences reach ~600 tokens.
+    # That forces the differentiable DMD rollout to do ~36-64 block-wise
+    # grad forward passes (vs ~8 at max_length=128) — the dominant cost.
+    data_max_length = config.data.get('max_length', 1024) if hasattr(config, 'data') else 1024
+    dataloader = get_dataloader_by_config(tokenizer, config.data, config, max_length=data_max_length)
     
     if config.train.decoder_resume_path is not None:
         ckpt = torch.load(config.train.decoder_resume_path, map_location='cpu', weights_only=True)
@@ -136,6 +142,24 @@ def main(args):
         )
         print(f'[async] Rollout pipeline on {rollout_device}')
 
+    # --- EMA LoRA for DMD fake model (optional) --------------------------
+    # When dmd_loss is enabled, create an EMA copy of the LoRA adapter
+    # weights.  The EMA model serves as the "fake" distribution in the
+    # DMD density-ratio score: c = log p_teacher - log p_fake.
+    # NOTE: DMD rollout is differentiable (Gumbel-softmax) and CANNOT be
+    # used with the async pipeline (which runs rollout under no_grad on a
+    # separate GPU).  The two are mutually exclusive.
+    ema_lora = None
+    dmd_loss = getattr(config.train, 'dmd_loss', False)
+    if dmd_loss:
+        if async_pipeline is not None:
+            raise ValueError("dmd_loss and async_rollout_device are mutually exclusive "
+                             "(DMD needs differentiable rollout, async runs no_grad).")
+        from utils.ema_lora import EMALoRA
+        ema_decay = getattr(config.train, 'dmd_ema_decay', 0.999)
+        ema_lora = EMALoRA(denoiser, decay=ema_decay)
+        print(f'[dmd] EMA LoRA fake model (decay={ema_decay})')
+
     # --- Per-step training closure ---------------------------------------
     # Extracted so the async-pipeline loop can train on the *previously*
     # fetched batch (whose rollout result is in hand) while the *next* batch
@@ -171,6 +195,7 @@ def main(args):
                 config        = config,
                 rollout_results = rollout_results,
                 lengths       = lengths,
+                ema_lora      = ema_lora,
             )
 
             if config.train.share_steps > 1:
@@ -186,6 +211,10 @@ def main(args):
 
             optimizer.step()
             optimizer.zero_grad()
+
+            # Update EMA fake model after optimizer step (DMD only)
+            if ema_lora is not None and accelerator.sync_gradients:
+                ema_lora.update(denoiser)
 
             # Sync updated LoRA weights to the rollout GPU so the next rollout
             # sees the latest adapter (1-step stale under prefetching — see

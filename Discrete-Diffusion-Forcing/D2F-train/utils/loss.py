@@ -409,7 +409,12 @@ def compute_dmd_loss(
     #   (small) so it represents the student's own recent-average distribution.
     # * Fresh student (for remaining masked positions) also uses the STUDENT
     #   block-size.
-    teacher_block_size = int(config.train.get('teacher_block_size', max(block_size * 4, L)))
+    # Adaptive default: max(block_size * 4, L) ensures the teacher always
+    # sees at least the full sequence (full bidirectional) — the most
+    # accurate target.  Scales automatically with seq_len so no manual
+    # tuning is needed when switching between seq_len=128 and 1024.
+    teacher_block_size = config.train.get('teacher_block_size', None) if config is not None else None
+    teacher_block_size = int(teacher_block_size) if teacher_block_size else max(block_size * 4, L)
 
     attention_mask_student = build_custom_float_attention_mask(
         student_decoded, question_length, block_size, device=device

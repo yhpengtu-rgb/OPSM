@@ -109,7 +109,8 @@ def main():
         print(f"log_p_student: shape={log_p_student.shape}, mean={log_p_student.mean().item():.4f}, requires_grad={log_p_student.requires_grad}")
 
     # --- Teacher + fake forwards (teacher = student w/ larger block, WITH LoRA) ---
-    teacher_block_size = int(config.train.get('teacher_block_size', max(config.train.block_size * 4, L)))
+    _tbs = config.train.get('teacher_block_size', None)
+    teacher_block_size = int(_tbs) if _tbs else max(config.train.block_size * 4, L)
     attn_student = build_custom_float_attention_mask(
         student_decoded, question_length, config.train.block_size, device=device).to(torch.float16)
     attn_teacher = build_custom_float_attention_mask(

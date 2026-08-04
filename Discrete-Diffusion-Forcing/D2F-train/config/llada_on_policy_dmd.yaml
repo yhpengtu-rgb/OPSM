@@ -42,7 +42,13 @@ train:
   dmd_grad_checkpoint: true   # gradient checkpointing for differentiable rollout
   student_decode_steps: 1
   teacher_rollout_steps: 1
-  teacher_block_size: 64       # teacher = student w/ larger block (more accurate target)
+  # teacher_block_size: adaptive — defaults to max(block_size * 4, L) in code.
+  # At seq_len=128 this gives 128 (full bidirectional); at seq_len=1024 it
+  # gives 1024 (full bidirectional).  The teacher always sees the whole
+  # sequence, providing the most accurate target for the DMD density ratio.
+  # Override only if you want a partially-blocked teacher (e.g. 256 for
+  # seq_len=1024 keeps 4 blocks with some causal structure).
+  teacher_block_size:
   temperature: 0.8
   top_p: 0.95
   async_rollout_device:        # MUST be empty for DMD (differentiable rollout)

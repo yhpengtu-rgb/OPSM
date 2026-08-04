@@ -1,0 +1,77 @@
+# DMD-style on-policy distillation config.
+#
+# Key differences from llada_on_policy_merged.yaml:
+#   * dmd_loss: true — uses Gumbel-softmax differentiable rollout + EMA fake
+#     model + density-ratio score (c = log p_teacher - log p_fake).
+#     Loss = -sg(c) · log p_student(token).
+#   * async_rollout_device must be empty — DMD rollout is differentiable
+#     (keeps gradients) and cannot run on a separate GPU under no_grad.
+#   * KV-cache, dynamic padding, and padding-excluded loss remain active.
+training_mode: 'llada'
+
+paths:
+  model: "/home/cw/workspace/Discrete-Diffusion-Forcing-main/LLaDA-8B-Instruct"
+  experiment: "ckpt_llada_instruct_on_policy_dmd"
+  data:
+    bs: "Lansechen/bs17k_collection_filtered_hard_maxlength600"
+    bs_easy: "Lansechen/bs17k_collection_filtered_easy_maxlength600"
+
+denoiser:
+  encoder:
+    name: "llada"
+    mask_id: 126336
+
+  decoder:
+    wiinit: true
+    name: "eagle_rope"
+    num_blocks: 1
+    seq_len: &seq_len 128
+    input_dim: 3584
+    hidden_dim: &dim 3584
+    vocab_size: 152064
+    block:
+      seq_len: *seq_len
+      hidden_dim: *dim
+      num_heads: 32
+
+train:
+  distillation_mode: "on-policy"
+  dmd_loss: true               # enable DMD-style loss
+  dmd_ema_decay: 0.999         # EMA fake model decay rate
+  dmd_grad_checkpoint: false  # disabled to avoid in-place op conflict
+  student_decode_steps: 1
+  teacher_rollout_steps: 1
+  # Teacher uses disable_adapter() (base model) + full bidirectional attention
+  # (torch.zeros([1,1,L,L])), matching the original D2F ref_logits path.
+  # No teacher_block_size config needed — the teacher always sees the full
+  # sequence regardless of seq_len.
+  temperature: 0.8
+  top_p: 0.95
+  async_rollout_device:        # MUST be empty for DMD (differentiable rollout)
+  decoder_resume_path:
+  head_resume_path:
+  skipped_keys:
+  global_step:
+  exp_name: &exp_name "llada_ddt_on_policy_dmd"
+  wandb_proj: *exp_name
+  output_dir: "ddt_on_policy_dmd"
+  logging_dir: "logs"
+  mixed_precision: "fp16"
+  gradient_accumulation_steps: 2
+  report_to: "no"
+  block_size: 16
+  lr: 1e-5
+  num_iters: 100
+  num_epochs:
+  eval_every: 100000
+  save_every: 100000
+  enable_shift: true
+  share_steps: 2
+  self_align: true
+  feature_align: false
+  self_step: true
+
+data:
+  name: "bs17k"
+  batch_size: 1          # dynamic padding + gradient_accumulation
+  max_length: 50

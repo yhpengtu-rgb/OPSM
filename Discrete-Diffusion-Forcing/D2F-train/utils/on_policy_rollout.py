@@ -194,23 +194,26 @@ def student_blockwise_rollout_dmd(
     vocab_size: int = 128000,
     is_llada: bool = False,
     shift: bool = True,
-    gumbel_tau: float = 1.0,
     use_grad_checkpoint: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """DMD-style differentiable rollout using Gumbel-softmax straight-through.
+    """DMD rollout: forward WITH grad, sampling DETACHED.
 
-    Unlike ``student_blockwise_rollout`` (no_grad, hard sampling), this
-    function keeps gradients throughout the rollout chain:
+    The DMD loss is ``-sg(c) · log_softmax(y1)[y1']`` where y1 is the
+    rollout logits (with grad) and y1' is the sampled token ID (just an
+    index, stop-gradient).  The gradient flows through y1 directly —
+    NOT through the sampling operation.  So no Gumbel-softmax or soft
+    embeddings are needed; regular detached sampling suffices.
 
-    1. Forward passes use ``inputs_embeds`` with **soft embeddings** at
-       previously-decoded positions (Gumbel-softmax output @ embed_weight),
-       allowing gradient to flow across blocks.
-    2. Sampling uses ``F.gumbel_softmax(hard=True)``: hard one-hot in
-       forward, soft gradient in backward.
-    3. Rollout logits at decoded positions are collected for the DMD loss.
+    This function differs from ``student_blockwise_rollout`` (which uses
+    ``no_grad``) only in that the forward passes keep gradients so the
+    logits y1 can be used in the DMD loss.
+
+    Args:
+        use_grad_checkpoint: gradient checkpointing for the forward passes
+            to fit multiple block-wise forwards in GPU memory.
 
     Returns:
-        student_decoded: [B, L] decoded token IDs (hard).
+        student_decoded: [B, L] decoded token IDs (hard, detached).
         decoded_positions: [B, L] bool mask of decoded positions.
         rollout_logits: [B, L, vocab_size] logits at decoded positions
             (WITH grad).  Zero at non-decoded positions.
@@ -220,8 +223,6 @@ def student_blockwise_rollout_dmd(
         device = input_ids.device
 
     model = _unwrap(student_model)
-    embed_layer = model.get_input_embeddings()  # nn.Embedding (callable)
-    embed_weight = embed_layer.weight  # [vocab, dim] — for matmul with Gumbel-softmax
 
     student_decoded = input_ids.clone()
     token_positions = torch.arange(L, device=device).expand(B, L)
@@ -234,19 +235,10 @@ def student_blockwise_rollout_dmd(
     total_blocks = [(npl + block_size - 1) // block_size for npl in non_prompt_lens]
     max_blocks = max(total_blocks) if total_blocks else 0
 
-    # Soft embeddings: [B, L, dim].  Initially zeros (no grad).  Updated
-    # differentiably at each decode step via element-wise masking (no
-    # in-place ops) so autograd can trace through the full chain.
-    # Match model dtype (fp16 under mixed precision) to avoid mat1/mat2
-    # dtype mismatch errors.
-    dim = embed_weight.shape[1]
-    model_dtype = embed_weight.dtype
-    soft_embeds = torch.zeros(B, L, dim, device=device, dtype=model_dtype)
-
-    # Rollout logits: collected as a list of (batch_idx, pos, logits) tuples.
+    # Collect rollout logits (WITH grad) as a list of (batch_idx, pos, logits).
     # In-place assignment on a zero tensor doesn't create a gradient link,
-    # so we collect logits differentiably and build the final tensor at the end.
-    rollout_logits_list = []  # [(batch_idx, pos, logits_tensor_with_grad)]
+    # so we collect logits and build the final tensor differentiably.
+    rollout_logits_list = []
 
     # Build the FULL block-causal attention mask ONCE (same as KV-cache version).
     attention_mask_full = build_custom_float_attention_mask(
@@ -263,44 +255,28 @@ def student_blockwise_rollout_dmd(
         )
         max_needed = min(max_needed, L)
 
-        # --- Build inputs_embeds for this subsequence ---------------------
-        # Hard embeddings (detached — no grad on prompt/mask positions)
-        hard_embeds_sub = embed_layer(student_decoded[:, :max_needed]).detach()  # [B, sub_L, dim]
-
-        # Overlay soft embeddings at previously-decoded positions
-        decode_mask_sub = decoded_positions[:, :max_needed].unsqueeze(-1).to(model_dtype)  # [B, sub_L, 1]
-        soft_embeds_sub = soft_embeds[:, :max_needed, :]  # [B, sub_L, dim] — may have grad
-        inputs_embeds_sub = hard_embeds_sub * (1 - decode_mask_sub) + soft_embeds_sub * decode_mask_sub
-
+        student_decoded_sub = student_decoded[:, :max_needed]
         attention_mask_sub = attention_mask_full[
             :, :, :max_needed, :max_needed
         ].contiguous()
-        attn_kw_sub = _attn_kwargs(is_llada, attention_mask_sub)
 
-        # --- Forward pass (WITH GRAD + optional gradient checkpointing) -------
-        # Gradient checkpointing recomputes activations during backward,
-        # reducing memory from O(num_blocks × activation) to O(1 × activation).
-        # Can be disabled via ``use_grad_checkpoint=False`` for debugging
-        # or when GPU memory is sufficient.
-        def _fwd(embeds, attn_bias):
+        # --- Forward pass (WITH GRAD + optional gradient checkpointing) ---
+        # The logits y1 must carry gradient for the DMD loss.  Sampling is
+        # detached — no Gumbel-softmax needed because the gradient flows
+        # through log_softmax(y1)[y1'], not through the sample y1'.
+        def _fwd(ids, attn_bias):
             kw = {"attention_bias": attn_bias} if is_llada else {"attention_mask": attn_bias}
-            return model(input_ids=None, inputs_embeds=embeds, **kw)
+            return model(ids, **kw)
 
         if use_grad_checkpoint:
             outputs = torch.utils.checkpoint.checkpoint(
-                _fwd, inputs_embeds_sub, attention_mask_sub,
+                _fwd, student_decoded_sub, attention_mask_sub,
                 use_reentrant=False,
             )
         else:
-            outputs = _fwd(inputs_embeds_sub, attention_mask_sub)
-        # accelerate's forward wrapper converts model outputs to fp32, but the
-        # embedding matrix (embed_weight) is fp16 (base loaded in fp16).  Cast
-        # logits back to the model dtype so the whole rollout chain —
-        # gumbel-softmax, soft-embed matmul (soft @ embed_weight), and the
-        # rollout_logits buffer — uses one consistent dtype and avoids
-        # mat1/mat2 dtype-mismatch errors.  The cast is differentiable, so the
-        # gradient still flows to the LoRA params.
-        logits = outputs.logits.to(model_dtype)  # [B, sub_L, vocab] — WITH grad
+            outputs = _fwd(student_decoded_sub, attention_mask_sub)
+
+        logits = outputs.logits  # [B, sub_L, vocab] — WITH grad
         if shift:
             logits = shift_logits(logits)
 
@@ -321,57 +297,25 @@ def student_blockwise_rollout_dmd(
                 pos = start_i + step
                 current_logits = logits[i, pos, :]  # [vocab] — WITH grad
 
-                # Gumbel-softmax straight-through estimator.
-                # ``gumbel_tau`` controls the sharpness of the soft gradient
-                # (separate from ``temperature`` which controls sampling).
-                soft = F.gumbel_softmax(
-                    current_logits.unsqueeze(0), tau=gumbel_tau, hard=True
-                )  # [1, vocab] — hard one-hot fwd, soft grad bwd
-                token_id = soft.argmax(-1).squeeze()  # hard token ID
+                # Sample DETACHED — y1' is just an index for the DMD loss,
+                # no gradient needs to flow through the sampling.
+                with torch.no_grad():
+                    sampled = _top_p_sample(
+                        current_logits.unsqueeze(0).detach(),
+                        temperature, top_p,
+                    )
+                    token_id = sampled.squeeze()
 
-                # Soft embedding (WITH grad through Gumbel-softmax)
-                soft_embed = (soft @ embed_weight).squeeze(0)  # [dim]
-
-                # --- Update student_decoded (hard token ID, no grad) -------
                 student_decoded[i, pos] = token_id
                 decoded_positions[i, pos] = True
-
-                # --- Store rollout logits (WITH grad) ----------------------
-                # Collect into a list.  In-place assignment
-                # (``preallocated[i, pos] = logits``) on a zero tensor does NOT
-                # create an autograd link to ``logits``, so the DMD loss would
-                # receive a zero gradient.  The full [B, L, vocab] tensor is
-                # assembled differentiably after the loop (see below).
                 rollout_logits_list.append((i, pos, current_logits))
 
-                # --- Update soft_embeds differentiably ---------------------
-                # Build [B, L, 1] update mask (1 at [i, pos], 0 elsewhere).
-                # The in-place setitem on ``update_mask`` is safe: it is a
-                # freshly-allocated tensor with no grad history.  The soft-embed
-                # broadcast below is fully differentiable wrt ``soft_embed``
-                # (no in-place setitem on a grad-bearing tensor — unlike the
-                # previous ``soft_expanded[i, pos, :] = soft_embed`` which could
-                # sever the grad link).
-                update_mask = torch.zeros(B, L, 1, device=device, dtype=model_dtype)
-                update_mask[i, pos, 0] = 1.0
-                # Broadcast soft_embed [dim] -> [B, L, dim] via the mask, then
-                # element-wise blend into soft_embeds (rebind, not in-place).
-                soft_embeds = (
-                    soft_embeds * (1 - update_mask)
-                    + update_mask * soft_embed.view(1, 1, -1)
-                )
-
     # --- Assemble rollout_logits [B, L, vocab] differentiably ------------
-    # In-place assignment (``tensor[i, pos] = logits``) on a pre-allocated
-    # zero tensor does NOT create an autograd link to ``logits``, so the DMD
-    # loss would see a zero gradient.  Instead, accumulate each decoded
-    # position's logits via a one-hot mask:
-    #     rollout_logits = sum_k  onehot(b_k, p_k) * logits_k
-    # Each term is differentiable wrt ``logits_k``; non-decoded positions
-    # remain exactly zero.  With student_decode_steps=1 the number of terms
-    # is small (~num_blocks), so the [B, L, vocab] intermediates are cheap.
+    # Accumulate each decoded position's logits via a one-hot mask so the
+    # gradient link to ``current_logits`` is preserved.
     if rollout_logits_list:
         vocab = rollout_logits_list[0][2].shape[0]
+        model_dtype = rollout_logits_list[0][2].dtype
         rollout_logits = torch.zeros(B, L, vocab, device=device, dtype=model_dtype)
         for bi, pos_i, lg in rollout_logits_list:
             mask = torch.zeros(B, L, 1, device=device, dtype=model_dtype)
@@ -379,7 +323,7 @@ def student_blockwise_rollout_dmd(
             rollout_logits = rollout_logits + mask * lg.view(1, 1, -1)
     else:
         rollout_logits = torch.zeros(
-            B, L, vocab_size, device=device, dtype=model_dtype
+            B, L, vocab_size, device=device
         )
 
     return student_decoded, decoded_positions, rollout_logits

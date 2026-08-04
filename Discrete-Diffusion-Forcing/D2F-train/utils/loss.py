@@ -374,9 +374,9 @@ def compute_dmd_loss(
     except Exception:
         rollout_vocab_size = 128000
 
-    # Step 1: Gumbel-softmax differentiable rollout (WITH grad)
-    # Read DMD-specific config values (with defaults for backward compat)
-    dmd_gumbel_tau = config.train.get('dmd_gumbel_tau', 1.0) if config is not None else 1.0
+    # Step 1: Rollout with grad (logits y1 kept for DMD loss, sampling detached)
+    # No Gumbel-softmax needed — DMD gradient flows through y1 (logits),
+    # not through the sampled token y1' (which is just a stop-gradient index).
     dmd_grad_ckpt = config.train.get('dmd_grad_checkpoint', True) if config is not None else True
 
     student_decoded, decoded_positions, rollout_logits = student_blockwise_rollout_dmd(
@@ -393,7 +393,6 @@ def compute_dmd_loss(
         vocab_size=rollout_vocab_size,
         is_llada=is_llada,
         shift=shift,
-        gumbel_tau=dmd_gumbel_tau,
         use_grad_checkpoint=dmd_grad_ckpt,
     )
 

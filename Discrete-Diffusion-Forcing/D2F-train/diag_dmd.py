@@ -108,23 +108,24 @@ def main():
         log_p_student = log_p_student.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         print(f"log_p_student: shape={log_p_student.shape}, mean={log_p_student.mean().item():.4f}, requires_grad={log_p_student.requires_grad}")
 
-    # --- Teacher + fake forwards (teacher = student w/ larger block, WITH LoRA) ---
-    _tbs = config.train.get('teacher_block_size', None)
-    teacher_block_size = int(_tbs) if _tbs else max(config.train.block_size * 4, L)
+    # --- Teacher + fake forwards ---
+    # Teacher = base model (disable_adapter) + full bidirectional mask,
+    # matching the original D2F ref_logits path.
+    # Fake   = EMA LoRA + student block-causal mask.
     attn_student = build_custom_float_attention_mask(
         student_decoded, question_length, config.train.block_size, device=device).to(torch.float16)
-    attn_teacher = build_custom_float_attention_mask(
-        student_decoded, question_length, teacher_block_size, device=device).to(torch.float16)
+    attn_teacher = torch.zeros([1, 1, L, L], dtype=torch.float16, device=device)
     student_kw = {"attention_bias": attn_student} if is_llada else {"attention_mask": attn_student}
     teacher_kw = {"attention_bias": attn_teacher} if is_llada else {"attention_mask": attn_teacher}
-    print(f"\n[diag] student_block_size={config.train.block_size}, teacher_block_size={teacher_block_size}")
+    print(f"\n[diag] student_block_size={config.train.block_size}, teacher=full_bidirectional (disable_adapter)")
     with torch.no_grad():
-        logits_teacher = denoiser(student_decoded, **teacher_kw).logits  # WITH LoRA, large block
-        if shift:
-            logits_teacher = shift_logits(logits_teacher)
+        with denoiser.disable_adapter():
+            logits_teacher = denoiser(student_decoded, **teacher_kw).logits  # base model, full bidirectional
+            if shift:
+                logits_teacher = shift_logits(logits_teacher)
     with torch.no_grad():
         with ema_lora.swap(denoiser):
-            logits_fake = denoiser(student_decoded, **student_kw).logits  # EMA LoRA, small block
+            logits_fake = denoiser(student_decoded, **student_kw).logits  # EMA LoRA, student block
             if shift:
                 logits_fake = shift_logits(logits_fake)
 

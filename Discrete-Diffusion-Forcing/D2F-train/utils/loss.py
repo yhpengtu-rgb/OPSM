@@ -398,30 +398,22 @@ def compute_dmd_loss(
     )
 
     # Step 2: Build attention masks.
-    # * Teacher = the SAME student model (WITH LoRA) evaluated with a LARGER
-    #   block-size — a less-parallel, more accurate variant of the student
-    #   (the D2F "teacher").  It is NOT the base model (disable_adapter): at
-    #   LoRA zero-init base == student, which collapses the density ratio
-    #   c = log p_teacher - log p_fake to 0 and freezes training.  The larger
-    #   block-size gives the teacher a different attention pattern, so
-    #   c != 0 from step 0 even with identical weights.
-    # * Fake  = EMA of the student, evaluated with the STUDENT block-size
-    #   (small) so it represents the student's own recent-average distribution.
-    # * Fresh student (for remaining masked positions) also uses the STUDENT
-    #   block-size.
-    # Adaptive default: max(block_size * 4, L) ensures the teacher always
-    # sees at least the full sequence (full bidirectional) — the most
-    # accurate target.  Scales automatically with seq_len so no manual
-    # tuning is needed when switching between seq_len=128 and 1024.
-    teacher_block_size = config.train.get('teacher_block_size', None) if config is not None else None
-    teacher_block_size = int(teacher_block_size) if teacher_block_size else max(block_size * 4, L)
-
+    # Following the original D2F codebase, the teacher uses:
+    #   * disable_adapter() — the pre-trained base model (no LoRA), which is
+    #     the more accurate, frozen target distribution.
+    #   * Full bidirectional attention — torch.zeros([1,1,L,L]), so every
+    #     token attends to every other token.  This matches the original
+    #     ref_logits path in compute_llada_loss / compute_loss.
+    # The fake model (EMA of student) and fresh student both use the
+    # STUDENT block-size (block-causal mask), representing the student's
+    # own block-wise causal attention pattern.
     attention_mask_student = build_custom_float_attention_mask(
         student_decoded, question_length, block_size, device=device
     ).to(torch.float16)
-    attention_mask_teacher = build_custom_float_attention_mask(
-        student_decoded, question_length, teacher_block_size, device=device
-    ).to(torch.float16)
+    # Full bidirectional mask (all zeros) — matches original D2F teacher.
+    attention_mask_teacher = torch.zeros(
+        [1, 1, L, L], dtype=torch.float16, device=device
+    )
 
     student_kwargs = (
         {"attention_bias": attention_mask_student} if is_llada
@@ -432,12 +424,13 @@ def compute_dmd_loss(
         else {"attention_mask": attention_mask_teacher}
     )
 
-    # Step 3: Teacher forward — full student model (WITH LoRA), large block.
-    # no_grad: the teacher is the (frozen-for-this-step) target distribution.
+    # Step 3: Teacher forward — base model (disable_adapter), full bidirectional.
+    # no_grad: the teacher is the frozen target distribution.
     with torch.no_grad():
-        logits_teacher = denoiser(student_decoded, **teacher_kwargs).logits
-        if shift:
-            logits_teacher = shift_logits(logits_teacher)
+        with denoiser.disable_adapter():
+            logits_teacher = denoiser(student_decoded, **teacher_kwargs).logits
+            if shift:
+                logits_teacher = shift_logits(logits_teacher)
 
     # Step 4: Fake forward — EMA LoRA, student block-size.
     with torch.no_grad():

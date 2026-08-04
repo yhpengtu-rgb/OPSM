@@ -38,7 +38,7 @@ train:
   distillation_mode: "on-policy"
   dmd_loss: true               # enable DMD-style loss
   dmd_ema_decay: 0.999         # EMA fake model decay rate
-  dmd_grad_checkpoint: true   # gradient checkpointing for rollout forward passes
+  dmd_grad_checkpoint: false  # disabled to avoid in-place op conflict
   student_decode_steps: 1
   teacher_rollout_steps: 1
   # Teacher uses disable_adapter() (base model) + full bidirectional attention
@@ -61,7 +61,7 @@ train:
   report_to: "no"
   block_size: 16
   lr: 1e-5
-  num_iters: 100          # 100-step training test
+  num_iters: 100
   num_epochs:
   eval_every: 100000
   save_every: 100000
@@ -74,4 +74,4 @@ train:
 data:
   name: "bs17k"
   batch_size: 1          # dynamic padding + gradient_accumulation
-  max_length: *seq_len
+  max_length: 50

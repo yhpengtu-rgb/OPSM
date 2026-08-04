@@ -15,6 +15,12 @@ build_custom_float_attention_mask per block.
 Positions are preserved: the subsequence is just the first sub_L tokens
 of the full sequence, so RoPE positional encodings are identical.
 
+NOTE: KV cache is NOT used here because block-causal attention requires
+recomputing attention for all positions when new tokens are added at
+specific block positions (not just appended). Each block's tokens are
+decoded independently within the block, but subsequent blocks attend to
+all prior tokens. A full forward pass per block iteration is required.
+
 Block-internal decoding (matching original D2F generation.py)
 --------------------------------------------------------------
 Within each block, positions are NOT decoded in fixed order.  Instead:
@@ -34,8 +40,15 @@ first, providing context for subsequent positions.
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List, NamedTuple
 from utils.util import build_custom_float_attention_mask, shift_logits
+
+
+class _DecodeAssignment(NamedTuple):
+    """A single position-to-token assignment to avoid in-place ops."""
+    batch_idx: int
+    position: int
+    token_id: torch.Tensor
 
 
 def _attn_kwargs(is_llada: bool, block_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -91,6 +104,79 @@ def _select_topk_positions(
     return masked_relative_positions[topk_relative_idx]
 
 
+def _apply_assignments(
+    decoded: torch.Tensor,
+    assignments: List[_DecodeAssignment],
+) -> torch.Tensor:
+    """Apply all assignments to a tensor WITHOUT in-place operations.
+
+    Uses index_put_ which creates a new tensor, avoiding autograd issues
+    with gradient checkpointing.
+
+    Args:
+        decoded: [B, L] tensor to update.
+        assignments: List of (batch_idx, position, token_id) tuples.
+
+    Returns:
+        New tensor with assignments applied.
+    """
+    if not assignments:
+        return decoded
+
+    batch_indices = torch.tensor([a.batch_idx for a in assignments],
+                                device=decoded.device, dtype=torch.long)
+    position_indices = torch.tensor([a.position for a in assignments],
+                                    device=decoded.device, dtype=torch.long)
+    token_values = torch.stack([a.token_id for a in assignments])
+
+    return decoded.index_put_((batch_indices, position_indices), token_values)
+
+
+def _assemble_rollout_logits(
+    logits_list: List[Tuple[int, int, torch.Tensor]],
+    B: int,
+    L: int,
+    vocab_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Assemble rollout logits efficiently using scatter, avoiding
+    the previous loop+mask multiplication approach.
+
+    Args:
+        logits_list: List of (batch_idx, position, logit_tensor) tuples.
+        B: Batch size.
+        L: Sequence length.
+        vocab_size: Vocabulary size.
+        device: Target device.
+        dtype: Target dtype.
+
+    Returns:
+        rollout_logits: [B, L, vocab_size] with grad at decoded positions.
+    """
+    if not logits_list:
+        return torch.zeros(B, L, vocab_size, device=device, dtype=dtype)
+
+    # Stack all logit values: [num_decoded, vocab]
+    all_logits = torch.stack([lg for _, _, lg in logits_list])
+
+    # Create index tensors for scatter
+    batch_idx = torch.tensor([bi for bi, _, _ in logits_list],
+                             device=device, dtype=torch.long)
+    pos_idx = torch.tensor([pi for _, pi, _ in logits_list],
+                           device=device, dtype=torch.long)
+
+    # Create empty result and scatter using index_put_ with accumulated values
+    # We need to flatten the [B, L] grid into [B*L] for the scatter operation
+    flat_target = torch.zeros(B * L, vocab_size, device=device, dtype=dtype)
+    flat_indices = batch_idx * L + pos_idx
+
+    # Use index_put_ for efficient scatter-add
+    result = flat_target.index_put_((flat_indices,), all_logits, accumulate=False)
+
+    return result.view(B, L, vocab_size)
+
+
 def student_blockwise_rollout(
     input_ids: torch.Tensor,
     student_model: torch.nn.Module,
@@ -111,6 +197,9 @@ def student_blockwise_rollout(
     Within each block, positions are selected by confidence (negative
     entropy) and decoded k at a time (k = num_decode_steps), matching
     the original D2F inference algorithm.
+
+    Uses non-in-place tensor updates via _apply_assignments to prevent
+    autograd issues with gradient checkpointing.
     """
     B, L = input_ids.shape
     if device is None:
@@ -172,6 +261,9 @@ def student_blockwise_rollout(
                 if shift:
                     logits = shift_logits(logits)
 
+            # Collect all assignments for this iteration, then apply them
+            assignments: List[_DecodeAssignment] = []
+
             for i in active:
                 start_i, end_i = block_ranges[i]
                 block_slice = student_decoded_sub[i, start_i:end_i]
@@ -190,8 +282,14 @@ def student_blockwise_rollout(
                     current_logits = logits[i, pos, :].unsqueeze(0)
                     sampled = _top_p_sample(current_logits, temperature, top_p)
                     token = sampled.squeeze()
-                    student_decoded[i, pos] = token
+                    assignments.append(_DecodeAssignment(
+                        batch_idx=i, position=pos, token_id=token
+                    ))
                     decoded_positions[i, pos] = True
+
+            # Apply all assignments safely (no in-place)
+            student_decoded = _apply_assignments(student_decoded, assignments)
+            student_decoded_sub = student_decoded[:, :max_needed]
 
     return student_decoded, decoded_positions
 
@@ -262,6 +360,9 @@ def student_blockwise_rollout_dmd(
     entropy) and decoded k at a time (k = num_decode_steps), matching
     the original D2F inference algorithm.
 
+    Uses non-in-place tensor updates via _apply_assignments to prevent
+    autograd issues with gradient checkpointing.
+
     Returns:
         student_decoded: [B, L] decoded token IDs (hard, detached).
         decoded_positions: [B, L] bool mask of decoded positions.
@@ -285,7 +386,7 @@ def student_blockwise_rollout_dmd(
     total_blocks = [(npl + block_size - 1) // block_size for npl in non_prompt_lens]
     max_blocks = max(total_blocks) if total_blocks else 0
 
-    rollout_logits_list = []
+    rollout_logits_list: List[Tuple[int, int, torch.Tensor]] = []
 
     attention_mask_full = build_custom_float_attention_mask(
         student_decoded, question_length, block_size, device=device
@@ -327,18 +428,27 @@ def student_blockwise_rollout_dmd(
             if not any_remaining:
                 break
 
+            # IMPORTANT: Make a contiguous copy of the sub-tensor before
+            # passing to gradient checkpointing. This prevents issues when
+            # the original tensor is later modified (via index_put_)
+            # between the checkpointed forward and its recomputation.
+            fwd_input = student_decoded_sub.clone()
+
             # Forward pass (WITH GRAD + optional gradient checkpointing)
             if use_grad_checkpoint:
                 outputs = torch.utils.checkpoint.checkpoint(
-                    _fwd, student_decoded_sub, attention_mask_sub,
+                    _fwd, fwd_input, attention_mask_sub,
                     use_reentrant=False,
                 )
             else:
-                outputs = _fwd(student_decoded_sub, attention_mask_sub)
+                outputs = _fwd(fwd_input, attention_mask_sub)
 
             logits = outputs.logits  # [B, sub_L, vocab] — WITH grad
             if shift:
                 logits = shift_logits(logits)
+
+            # Collect all assignments for this iteration
+            assignments: List[_DecodeAssignment] = []
 
             for i in active:
                 start_i, end_i = block_ranges[i]
@@ -368,19 +478,22 @@ def student_blockwise_rollout_dmd(
                         )
                         token_id = sampled.squeeze()
 
-                    student_decoded[i, pos] = token_id
+                    assignments.append(_DecodeAssignment(
+                        batch_idx=i, position=pos, token_id=token_id
+                    ))
                     decoded_positions[i, pos] = True
                     rollout_logits_list.append((i, pos, current_logits))
 
-    # --- Assemble rollout_logits [B, L, vocab] differentiably ------------
+            # Apply all assignments safely (no in-place)
+            student_decoded = _apply_assignments(student_decoded, assignments)
+            student_decoded_sub = student_decoded[:, :max_needed]
+
+    # --- Assemble rollout_logits [B, L, vocab] efficiently -----------------
     if rollout_logits_list:
-        vocab = rollout_logits_list[0][2].shape[0]
         model_dtype = rollout_logits_list[0][2].dtype
-        rollout_logits = torch.zeros(B, L, vocab, device=device, dtype=model_dtype)
-        for bi, pos_i, lg in rollout_logits_list:
-            mask = torch.zeros(B, L, 1, device=device, dtype=model_dtype)
-            mask[bi, pos_i, 0] = 1.0
-            rollout_logits = rollout_logits + mask * lg.view(1, 1, -1)
+        rollout_logits = _assemble_rollout_logits(
+            rollout_logits_list, B, L, vocab_size, device, model_dtype,
+        )
     else:
         rollout_logits = torch.zeros(
             B, L, vocab_size, device=device

@@ -141,7 +141,9 @@ def compute_on_policy_loss(
         teacher_rollout_steps=1,
         temperature=1.0,
         top_p=0.95,
-        config=None
+        config=None,
+        rollout_results=None,
+        lengths=None
 ):
     """Compute on-policy distillation loss.
 
@@ -171,6 +173,12 @@ def compute_on_policy_loss(
         temperature: Sampling temperature.
         top_p: Top-p sampling parameter.
         config: Configuration object.
+        rollout_results: Externally-provided rollout (async pipeline). When not
+            None, the internal rollout call is skipped.
+        lengths: Real-token length per sample [B] (question + answer, excl.
+            pure padding). When provided, positions >= length are excluded
+            from the loss so the reported loss is consistent across batch
+            sizes and padding lengths (dynamic padding). None = no exclusion.
 
     Returns:
         Dictionary containing loss values.
@@ -198,26 +206,35 @@ def compute_on_policy_loss(
         rollout_vocab_size = 128000
 
     # Step 1: Perform on-policy rollout (student + teacher)
-    rollout_results = on_policy_distillation_step(
-        input_ids=input_ids,
-        student_model=denoiser,
-        teacher_model=denoiser,  # Teacher is the same model but with full attention
-        question_length=question_length,
-        block_size=block_size,
-        student_decode_steps=student_decode_steps,
-        teacher_rollout_steps=teacher_rollout_steps,
-        mask_id=mask_id,
-        eos_id=eos_id,
-        temperature=temperature,
-        top_p=top_p,
-        device=device,
-        vocab_size=rollout_vocab_size,
-        is_llada=is_llada,
-        shift=shift,
-    )
+    # If rollout_results are provided externally (async pipeline), skip
+    # the internal rollout call.
+    if rollout_results is not None:
+        student_decoded = rollout_results['student_decoded']
+        decoded_positions = rollout_results['decoded_positions']
+    else:
+        rollout_results = on_policy_distillation_step(
+            input_ids=input_ids,
+            student_model=denoiser,
+            teacher_model=denoiser,
+            question_length=question_length,
+            block_size=block_size,
+            student_decode_steps=student_decode_steps,
+            teacher_rollout_steps=teacher_rollout_steps,
+            mask_id=mask_id,
+            eos_id=eos_id,
+            temperature=temperature,
+            top_p=top_p,
+            device=device,
+            vocab_size=rollout_vocab_size,
+            is_llada=is_llada,
+            shift=shift,
+        )
+        student_decoded = rollout_results['student_decoded']
+        decoded_positions = rollout_results['decoded_positions']
 
-    student_decoded = rollout_results['student_decoded']
-    decoded_positions = rollout_results['decoded_positions']
+    # Free rollout intermediates before the gradient-bearing forward pass
+    del rollout_results
+    torch.cuda.empty_cache()
 
     # Step 2: Compute forward pass for student on its own decoded sequence
     # (to get gradients for training). Pass the 4D block mask through the
@@ -257,6 +274,19 @@ def compute_on_policy_loss(
             teacher_probs = F.softmax(logits_teacher, dim=-1)
 
     # Step 4: Compute distillation loss
+    # Build a valid-position mask that excludes pure padding (positions >=
+    # ``length``) when ``lengths`` is provided. With dynamic padding the pad
+    # region shrinks/grows per batch; including it would make the mean loss
+    # depend on how much padding a batch happens to carry. Excluding pad
+    # positions yields a loss that is comparable across batch sizes and
+    # padding strategies (only real answer tokens + the closing EOS count).
+    if lengths is not None:
+        token_positions = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+        valid_mask = token_positions < lengths.to(device).unsqueeze(1)  # [B, L]
+        decoded_positions = decoded_positions & valid_mask
+    else:
+        valid_mask = None
+
     # Only compute loss on positions that were decoded by student
     if decoded_positions.any():
         token_loss = F.cross_entropy(
@@ -270,6 +300,8 @@ def compute_on_policy_loss(
     # Also compute supervised loss on remaining masked positions (positions
     # the student did not decode — target is the ground-truth token).
     remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
+    if valid_mask is not None:
+        remaining_mask = remaining_mask & valid_mask
     if remaining_mask.any():
         token_loss_remaining = F.cross_entropy(
             logits_student[remaining_mask],
@@ -280,6 +312,201 @@ def compute_on_policy_loss(
 
     # Compute mean loss
     loss = token_loss.mean()
+
+    losses = {
+        'loss': loss,
+        'student_decoded_length': decoded_positions.sum().float() / B,
+        'remaining_mask_length': remaining_mask.sum().float() / B,
+    }
+
+    return losses
+
+
+def compute_dmd_loss(
+    input_ids,
+    denoiser,
+    ema_lora,
+    question_length,
+    mask_id,
+    block_size,
+    enable_shift,
+    share_steps,
+    self_align,
+    feature_align,
+    self_step,
+    eos_id,
+    student_decode_steps=1,
+    teacher_rollout_steps=1,
+    temperature=1.0,
+    top_p=0.95,
+    config=None,
+    lengths=None,
+):
+    """DMD-style on-policy loss.
+
+    Loss = -sg(c) · log p_student(token)
+
+    where c = log p_teacher(token) - log p_fake(token) is the density-ratio
+    score (stop-gradient).  For decoded positions, ``log p_student`` comes
+    from the Gumbel-softmax rollout logits (y1); for remaining masked
+    positions, it comes from a fresh student forward pass on the
+    fully-decoded sequence.
+
+    Args:
+        ema_lora: EMALoRA instance for fake-model forward (density ratio).
+        All other args same as ``compute_on_policy_loss``.
+
+    Returns:
+        Dictionary with 'loss' and diagnostic metrics.
+    """
+    from utils.on_policy_rollout import student_blockwise_rollout_dmd
+
+    B, L = input_ids.shape
+    device = input_ids.device
+
+    training_mode = config.get('training_mode', 'dream') if config is not None else 'dream'
+    is_llada = (training_mode == 'llada')
+    shift = (not is_llada) and enable_shift
+
+    try:
+        base = denoiser.get_base_model() if hasattr(denoiser, 'get_base_model') else denoiser
+        rollout_vocab_size = base.config.vocab_size
+    except Exception:
+        rollout_vocab_size = 128000
+
+    # Step 1: Rollout with grad (logits y1 kept for DMD loss, sampling detached)
+    # No Gumbel-softmax needed — DMD gradient flows through y1 (logits),
+    # not through the sampled token y1' (which is just a stop-gradient index).
+    dmd_grad_ckpt = config.train.get('dmd_grad_checkpoint', True) if config is not None else True
+
+    student_decoded, decoded_positions, rollout_logits = student_blockwise_rollout_dmd(
+        input_ids=input_ids,
+        student_model=denoiser,
+        question_length=question_length,
+        block_size=block_size,
+        num_decode_steps=student_decode_steps,
+        mask_id=mask_id,
+        eos_id=eos_id,
+        temperature=temperature,
+        top_p=top_p,
+        device=device,
+        vocab_size=rollout_vocab_size,
+        is_llada=is_llada,
+        shift=shift,
+        use_grad_checkpoint=dmd_grad_ckpt,
+    )
+
+    # Step 2: Build attention masks.
+    # Following the original D2F codebase, the teacher uses:
+    #   * disable_adapter() — the pre-trained base model (no LoRA), which is
+    #     the more accurate, frozen target distribution.
+    #   * Full bidirectional attention — torch.zeros([1,1,L,L]), so every
+    #     token attends to every other token.  This matches the original
+    #     ref_logits path in compute_llada_loss / compute_loss.
+    # The fake model (EMA of student) and fresh student both use the
+    # STUDENT block-size (block-causal mask), representing the student's
+    # own block-wise causal attention pattern.
+    attention_mask_student = build_custom_float_attention_mask(
+        student_decoded, question_length, block_size, device=device
+    ).to(torch.float16)
+    # Full bidirectional mask (all zeros) — matches original D2F teacher.
+    attention_mask_teacher = torch.zeros(
+        [1, 1, L, L], dtype=torch.float16, device=device
+    )
+
+    student_kwargs = (
+        {"attention_bias": attention_mask_student} if is_llada
+        else {"attention_mask": attention_mask_student}
+    )
+    teacher_kwargs = (
+        {"attention_bias": attention_mask_teacher} if is_llada
+        else {"attention_mask": attention_mask_teacher}
+    )
+
+    # Step 3: Teacher forward — base model (disable_adapter), full bidirectional.
+    # no_grad: the teacher is the frozen target distribution.
+    with torch.no_grad():
+        with denoiser.disable_adapter():
+            logits_teacher = denoiser(student_decoded, **teacher_kwargs).logits
+            if shift:
+                logits_teacher = shift_logits(logits_teacher)
+
+    # Step 4: Fake forward — EMA LoRA, student block-size.
+    with torch.no_grad():
+        with ema_lora.swap(denoiser):
+            logits_fake = denoiser(student_decoded, **student_kwargs).logits
+            if shift:
+                logits_fake = shift_logits(logits_fake)
+
+    # Step 5: Fresh student forward for remaining positions (WITH grad)
+    logits_student_fresh = denoiser(student_decoded, **student_kwargs).logits
+    if shift:
+        logits_student_fresh = shift_logits(logits_student_fresh)
+
+    # Step 6: Build valid-position mask (exclude pure padding)
+    if lengths is not None:
+        token_positions = torch.arange(L, device=device).unsqueeze(0)
+        valid_mask = token_positions < lengths.to(device).unsqueeze(1)
+        decoded_positions = decoded_positions & valid_mask
+    else:
+        valid_mask = None
+
+    # Step 7: DMD loss on decoded positions (using rollout logits y1)
+    if decoded_positions.any():
+        sampled_tokens = student_decoded[decoded_positions]  # y1'
+
+        # log p_student from rollout logits (Gumbel-softmax grad chain)
+        log_p_student = F.log_softmax(rollout_logits[decoded_positions], dim=-1)
+        log_p_student = log_p_student.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+
+        # Score c = log p_teacher - log p_fake (NO grad)
+        with torch.no_grad():
+            log_p_teacher = F.log_softmax(logits_teacher[decoded_positions], dim=-1)
+            log_p_teacher = log_p_teacher.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+            log_p_fake = F.log_softmax(logits_fake[decoded_positions], dim=-1)
+            log_p_fake = log_p_fake.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+            c = log_p_teacher - log_p_fake  # density ratio
+
+        loss_decoded = -(c.detach() * log_p_student).mean()
+    else:
+        loss_decoded = torch.tensor(0.0, device=device, requires_grad=True)
+
+    # Step 8: DMD loss on remaining masked positions (using fresh forward)
+    remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
+    if valid_mask is not None:
+        remaining_mask = remaining_mask & valid_mask
+
+    if remaining_mask.any():
+        gt_tokens = input_ids[remaining_mask]  # ground-truth tokens
+
+        # log p_student from fresh forward (WITH grad)
+        log_p_student_rem = F.log_softmax(logits_student_fresh[remaining_mask], dim=-1)
+        log_p_student_rem = log_p_student_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
+
+        # Score c for remaining positions (NO grad)
+        with torch.no_grad():
+            log_p_teacher_rem = F.log_softmax(logits_teacher[remaining_mask], dim=-1)
+            log_p_teacher_rem = log_p_teacher_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
+            log_p_fake_rem = F.log_softmax(logits_fake[remaining_mask], dim=-1)
+            log_p_fake_rem = log_p_fake_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
+            c_rem = log_p_teacher_rem - log_p_fake_rem
+
+        loss_remaining = -(c_rem.detach() * log_p_student_rem).mean()
+    else:
+        loss_remaining = torch.tensor(0.0, device=device, requires_grad=True)
+
+    loss = loss_decoded + loss_remaining
+
+    # Safety: always connect the loss to model parameters via the fresh student
+    # forward (Step 5, always runs WITH grad).  When both decoded_positions and
+    # remaining_mask are empty (e.g. a batch whose question alone fills
+    # max_length), loss_decoded / loss_remaining are leaf tensors with no
+    # grad_fn, so accelerator.backward() is a no-op and the GradScaler's
+    # unscale_ never records an inf check — triggering "No inf checks were
+    # recorded for this optimizer" at optimizer.step().  The 0.0 multiplier
+    # adds a zero-valued grad path through logits_student_fresh without
+    # changing the loss value.
+    loss = loss + 0.0 * logits_student_fresh[0, 0, 0]
 
     losses = {
         'loss': loss,
@@ -302,11 +529,15 @@ def compute_loss_by_config(
         feature_align,
         self_step,
         eos_id,
-        config
+        config,
+        rollout_results=None,
+        lengths=None,
+        ema_lora=None
 ):
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
     distillation_mode = config.train.get('distillation_mode', 'off-policy') if hasattr(config, 'train') else 'off-policy'
+    dmd_loss = config.train.get('dmd_loss', False) if hasattr(config, 'train') else False
 
     # LLaDA's mask token id (from config.json) is 126336; the config file's
     # ``denoiser.encoder.mask_id`` is only correct for Dream. Mirror the
@@ -320,7 +551,23 @@ def compute_loss_by_config(
         teacher_rollout_steps = config.train.get('teacher_rollout_steps', 1)
         temperature = config.train.get('temperature', 1.0)
         top_p = config.train.get('top_p', 0.95)
-        
+
+        # DMD-style loss (Gumbel-softmax rollout + EMA fake model)
+        if dmd_loss:
+            if ema_lora is None:
+                raise ValueError("dmd_loss requires ema_lora to be passed to compute_loss_by_config")
+            return compute_dmd_loss(
+                input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
+                enable_shift, share_steps, self_align, feature_align, self_step, eos_id,
+                student_decode_steps=student_decode_steps,
+                teacher_rollout_steps=teacher_rollout_steps,
+                temperature=temperature,
+                top_p=top_p,
+                config=config,
+                lengths=lengths,
+            )
+
+        # Standard on-policy KL loss
         if training_mode == 'llada':
             return compute_on_policy_loss(
                 input_ids, denoiser, question_length, mask_id, block_size,
@@ -329,7 +576,9 @@ def compute_loss_by_config(
                 teacher_rollout_steps=teacher_rollout_steps,
                 temperature=temperature,
                 top_p=top_p,
-                config=config
+                config=config,
+                rollout_results=rollout_results,
+                lengths=lengths,
             )
         elif training_mode == 'dream':
             return compute_on_policy_loss(
@@ -339,7 +588,9 @@ def compute_loss_by_config(
                 teacher_rollout_steps=teacher_rollout_steps,
                 temperature=temperature,
                 top_p=top_p,
-                config=config
+                config=config,
+                rollout_results=rollout_results,
+                lengths=lengths,
             )
         else:
             raise ValueError(f"Unsupported training mode: {training_mode}")

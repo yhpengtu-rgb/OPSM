@@ -175,7 +175,7 @@ def test_student_rollout():
     
     # Run student rollout
     print("\nRunning student_blockwise_rollout...")
-    student_decoded, decoded_positions, log_probs = student_blockwise_rollout(
+    student_decoded, decoded_positions = student_blockwise_rollout(
         input_ids=input_ids,
         student_model=model,
         question_length=question_length,
@@ -191,7 +191,6 @@ def test_student_rollout():
     # Validate shapes
     assert student_decoded.shape == input_ids.shape, f"Shape mismatch: {student_decoded.shape}"
     assert decoded_positions.shape == input_ids.shape, f"Shape mismatch: {decoded_positions.shape}"
-    assert log_probs.shape == (B, L, vocab_size), f"Shape mismatch: {log_probs.shape}"
     
     # Validate prompt preservation
     for i in range(B):

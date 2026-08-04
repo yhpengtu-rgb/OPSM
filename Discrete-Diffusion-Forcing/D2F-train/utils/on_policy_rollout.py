@@ -194,6 +194,8 @@ def student_blockwise_rollout_dmd(
     vocab_size: int = 128000,
     is_llada: bool = False,
     shift: bool = True,
+    gumbel_tau: float = 1.0,
+    use_grad_checkpoint: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """DMD-style differentiable rollout using Gumbel-softmax straight-through.
 
@@ -275,18 +277,22 @@ def student_blockwise_rollout_dmd(
         ].contiguous()
         attn_kw_sub = _attn_kwargs(is_llada, attention_mask_sub)
 
-        # --- Forward pass (WITH GRAD + gradient checkpointing) ------------
+        # --- Forward pass (WITH GRAD + optional gradient checkpointing) -------
         # Gradient checkpointing recomputes activations during backward,
         # reducing memory from O(num_blocks × activation) to O(1 × activation).
-        # Essential for fitting the differentiable rollout chain in 32GB.
+        # Can be disabled via ``use_grad_checkpoint=False`` for debugging
+        # or when GPU memory is sufficient.
         def _fwd(embeds, attn_bias):
             kw = {"attention_bias": attn_bias} if is_llada else {"attention_mask": attn_bias}
             return model(input_ids=None, inputs_embeds=embeds, **kw)
 
-        outputs = torch.utils.checkpoint.checkpoint(
-            _fwd, inputs_embeds_sub, attention_mask_sub,
-            use_reentrant=False,
-        )
+        if use_grad_checkpoint:
+            outputs = torch.utils.checkpoint.checkpoint(
+                _fwd, inputs_embeds_sub, attention_mask_sub,
+                use_reentrant=False,
+            )
+        else:
+            outputs = _fwd(inputs_embeds_sub, attention_mask_sub)
         # accelerate's forward wrapper converts model outputs to fp32, but the
         # embedding matrix (embed_weight) is fp16 (base loaded in fp16).  Cast
         # logits back to the model dtype so the whole rollout chain —
@@ -315,9 +321,11 @@ def student_blockwise_rollout_dmd(
                 pos = start_i + step
                 current_logits = logits[i, pos, :]  # [vocab] — WITH grad
 
-                # Gumbel-softmax straight-through estimator
+                # Gumbel-softmax straight-through estimator.
+                # ``gumbel_tau`` controls the sharpness of the soft gradient
+                # (separate from ``temperature`` which controls sampling).
                 soft = F.gumbel_softmax(
-                    current_logits.unsqueeze(0), tau=temperature, hard=True
+                    current_logits.unsqueeze(0), tau=gumbel_tau, hard=True
                 )  # [1, vocab] — hard one-hot fwd, soft grad bwd
                 token_id = soft.argmax(-1).squeeze()  # hard token ID
 

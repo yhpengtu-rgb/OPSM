@@ -375,6 +375,10 @@ def compute_dmd_loss(
         rollout_vocab_size = 128000
 
     # Step 1: Gumbel-softmax differentiable rollout (WITH grad)
+    # Read DMD-specific config values (with defaults for backward compat)
+    dmd_gumbel_tau = config.train.get('dmd_gumbel_tau', 1.0) if config is not None else 1.0
+    dmd_grad_ckpt = config.train.get('dmd_grad_checkpoint', True) if config is not None else True
+
     student_decoded, decoded_positions, rollout_logits = student_blockwise_rollout_dmd(
         input_ids=input_ids,
         student_model=denoiser,
@@ -389,6 +393,8 @@ def compute_dmd_loss(
         vocab_size=rollout_vocab_size,
         is_llada=is_llada,
         shift=shift,
+        gumbel_tau=dmd_gumbel_tau,
+        use_grad_checkpoint=dmd_grad_ckpt,
     )
 
     # Step 2: Build attention masks.

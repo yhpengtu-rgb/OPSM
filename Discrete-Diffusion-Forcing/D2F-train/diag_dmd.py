@@ -74,6 +74,8 @@ def main():
         vocab_size=vsize,
         is_llada=is_llada,
         shift=shift,
+        gumbel_tau=config.train.get('dmd_gumbel_tau', 1.0),
+        use_grad_checkpoint=config.train.get('dmd_grad_checkpoint', True),
     )
     print("\n=== ROLLOUT DIAGNOSTICS ===")
     print(f"decoded_positions.sum(): {decoded_positions.sum().item()}")

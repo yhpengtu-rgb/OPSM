@@ -378,16 +378,16 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
         block_size = global_config.train.block_size
 
     pad_id = tokenizer.eos_token_id
-    dataloader = DataLoader(
-        dataset,
-        batch_size  = config.batch_size,
-        collate_fn  = lambda x: collate_fn_dynamic(x, pad_id, block_size=block_size),
-        num_workers = config.num_workers,
-        shuffle     = True,
-        pin_memory  = True,
-        prefetch_factor = 2,
-        persistent_workers = True,
-    )
+    loader_kwargs = {
+        'batch_size': config.batch_size,
+        'collate_fn': lambda x: collate_fn_dynamic(x, pad_id, block_size=block_size),
+        'num_workers': config.num_workers,
+        'shuffle': True,
+        'pin_memory': True,
+    }
+    if config.num_workers > 0:
+        loader_kwargs.update(prefetch_factor=2, persistent_workers=True)
+    dataloader = DataLoader(dataset, **loader_kwargs)
 
     return dataloader
 if __name__ == "__main__":

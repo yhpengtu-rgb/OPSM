@@ -478,6 +478,120 @@ def compute_dmd_loss(
     return losses
 
 
+def compute_transition_csm_loss(
+    input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
+    enable_shift, eos_id, student_decode_steps=1, temperature=1.0, top_p=0.95,
+    config=None, lengths=None, backward_callback=None,
+):
+    """Run CSM on each hard rollout transition and release its graph immediately."""
+    from utils.on_policy_rollout import student_blockwise_rollout_dmd
+
+    if backward_callback is None:
+        raise ValueError("transition_csm requires a per-transition backward callback")
+    B, L = input_ids.shape
+    device = input_ids.device
+    is_llada = config.get('training_mode', 'dream') == 'llada'
+    shift = (not is_llada) and enable_shift
+    student_decoded, decoded_positions, transitions = student_blockwise_rollout_dmd(
+        input_ids=input_ids, student_model=denoiser, question_length=question_length,
+        block_size=block_size, num_decode_steps=student_decode_steps, mask_id=mask_id,
+        eos_id=eos_id, temperature=temperature, top_p=top_p, device=device,
+        is_llada=is_llada, shift=shift, lengths=lengths, transition_csm=True,
+    )
+    if lengths is not None:
+        valid_lengths = lengths.to(device=device, dtype=torch.long).clamp(0, L)
+    else:
+        valid_lengths = torch.full((B,), L, dtype=torch.long, device=device)
+    prompt_lengths = torch.minimum(
+        question_length.to(device=device, dtype=torch.long).clamp(0, L), valid_lengths
+    )
+    valid_mask = torch.arange(L, device=device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+    transition_count = len(transitions)
+    transition_total = torch.zeros((), device=device)
+    last_remaining_loss = torch.zeros((), device=device)
+    last_remaining_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+
+    for transition in transitions:
+        predecessor_ids = transition['predecessor_ids']
+        successor_ids = transition['successor_ids']
+        answer_mask = transition['answer_mask']
+        csm_mask = answer_mask & transition['advanced_mask'][:, None]
+        predecessor_mask = build_custom_float_attention_mask(
+            predecessor_ids, prompt_lengths, block_size, device=device
+        ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+        successor_mask = build_custom_float_attention_mask(
+            successor_ids, prompt_lengths, block_size, device=device
+        ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+        teacher_mask = torch.zeros([B, 1, L, L], dtype=torch.float16, device=device).masked_fill(
+            ~valid_mask[:, None, None, :], float('-inf')
+        )
+        student_kwargs = {'attention_bias': predecessor_mask} if is_llada else {'attention_mask': predecessor_mask}
+        fake_kwargs = {'attention_bias': successor_mask} if is_llada else {'attention_mask': successor_mask}
+        teacher_kwargs = {'attention_bias': teacher_mask} if is_llada else {'attention_mask': teacher_mask}
+        with torch.no_grad():
+            with denoiser.disable_adapter():
+                teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
+                if shift:
+                    teacher_logits = shift_logits(teacher_logits)
+            with ema_lora.swap(denoiser):
+                fake_logits = denoiser(successor_ids, **fake_kwargs).logits
+                if shift:
+                    fake_logits = shift_logits(fake_logits)
+        student_logits_full = denoiser(predecessor_ids, **student_kwargs).logits
+        if shift:
+            student_logits_full = shift_logits(student_logits_full)
+        student_logits = student_logits_full[csm_mask]
+        teacher_logits = teacher_logits[csm_mask].float()
+        fake_logits = fake_logits[csm_mask].float()
+        student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
+        fake_score = fake_logits - (student_probs * fake_logits).sum(dim=-1, keepdim=True)
+        teacher_score = teacher_logits - (student_probs * teacher_logits).sum(dim=-1, keepdim=True)
+        transition_loss = (2.0 * student_probs * (fake_score - teacher_score)).detach()
+        transition_loss = (transition_loss * student_logits.float()).sum(dim=-1).mean()
+        transition_loss = transition_loss + sum(
+            parameter.reshape(-1)[0] * 0.0 for parameter in denoiser.parameters()
+            if parameter.requires_grad
+        )
+        transition_total = transition_total + transition_loss.detach() / transition_count
+        backward_callback(transition_loss / transition_count)
+
+        # The configured auxiliary objective is evaluated only on the final
+        # successor state and its remaining-mask positions.
+        last_remaining_mask = (successor_ids == mask_id) & answer_mask
+
+    if not transitions:
+        backward_callback(sum(
+            parameter.reshape(-1)[0] * 0.0 for parameter in denoiser.parameters()
+            if parameter.requires_grad
+        ))
+
+    aux_remaining_weight = config.train.get('aux_remaining_weight', 0.0)
+    if aux_remaining_weight and transitions and last_remaining_mask.any():
+        successor_ids = transitions[-1]['successor_ids']
+        block_mask = build_custom_float_attention_mask(
+            successor_ids, prompt_lengths, block_size, device=device
+        ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+        student_kwargs = {'attention_bias': block_mask} if is_llada else {'attention_mask': block_mask}
+        aux_logits = denoiser(successor_ids, **student_kwargs).logits
+        if shift:
+            aux_logits = shift_logits(aux_logits)
+        last_remaining_loss = F.cross_entropy(aux_logits[last_remaining_mask], input_ids[last_remaining_mask])
+        backward_callback(aux_remaining_weight * last_remaining_loss)
+
+    # Backward was already performed per transition. Keep a detached scalar for
+    # logging and avoid a second backward from the outer training loop.
+    total_loss = transition_total + aux_remaining_weight * last_remaining_loss.detach()
+    return {
+        'loss': total_loss,
+        'transition_dmd_loss': transition_total,
+        'aux_remaining_loss': last_remaining_loss.detach(),
+        'student_decoded_length': decoded_positions.sum().float() / B,
+        'remaining_mask_length': last_remaining_mask.sum().float() / B,
+        'transition_count': torch.tensor(len(transitions), device=device),
+        'backward_done': True,
+    }
+
+
 def compute_loss_by_config(
         input_ids,
         denoiser,
@@ -493,12 +607,14 @@ def compute_loss_by_config(
         config,
         rollout_results=None,
         lengths=None,
-        ema_lora=None
+        ema_lora=None,
+        backward_callback=None,
 ):
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
     distillation_mode = config.train.get('distillation_mode', 'off-policy') if hasattr(config, 'train') else 'off-policy'
     dmd_loss = config.train.get('dmd_loss', False) if hasattr(config, 'train') else False
+    transition_csm = config.train.get('transition_csm', False) if hasattr(config, 'train') else False
 
     # LLaDA's mask token id (from config.json) is 126336; the config file's
     # ``denoiser.encoder.mask_id`` is only correct for Dream. Mirror the
@@ -513,7 +629,19 @@ def compute_loss_by_config(
         temperature = config.train.get('temperature', 1.0)
         top_p = config.train.get('top_p', 0.95)
 
-        # DMD-style loss (Gumbel-softmax rollout + EMA fake model)
+        # Per-step hard-rollout transition CSM uses the EMA fake even when the
+        # legacy final-state dmd_loss mode is disabled.
+        if transition_csm:
+            if ema_lora is None:
+                raise ValueError("transition_csm requires ema_lora to be passed to compute_loss_by_config")
+            return compute_transition_csm_loss(
+                input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
+                enable_shift, eos_id, student_decode_steps=student_decode_steps,
+                temperature=temperature, top_p=top_p, config=config, lengths=lengths,
+                backward_callback=backward_callback,
+            )
+
+        # Legacy DMD-style final-state loss.
         if dmd_loss:
             if ema_lora is None:
                 raise ValueError("dmd_loss requires ema_lora to be passed to compute_loss_by_config")

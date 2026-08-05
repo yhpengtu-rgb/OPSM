@@ -374,8 +374,9 @@ def student_blockwise_rollout_dmd(
     is_llada: bool = False,
     shift: bool = True,
     lengths: Optional[torch.Tensor] = None,
+    transition_csm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
-    """Produce a detached final rollout state for successor-state DMD.
+    """Produce detached rollout states for DMD or per-step Transition-CSM.
 
     Every block completes ``num_decode_steps`` top-1 unmask operations before
     the sole transition record is created. Therefore ``transitions[-1]`` is
@@ -481,14 +482,29 @@ def student_blockwise_rollout_dmd(
                     ))
                     decoded_positions[i, pos] = True
 
+                predecessor_ids = student_decoded.detach().clone()
+                advanced_mask = torch.zeros(B, dtype=torch.bool, device=device)
+                advanced_mask[active_with_masks] = True
                 student_decoded = _apply_assignments(student_decoded, assignments)
                 student_decoded_sub = student_decoded[:, :max_needed]
+                if transition_csm:
+                    answer_mask = (
+                        (token_positions >= prompt_lengths.unsqueeze(1))
+                        & (token_positions < valid_lengths.unsqueeze(1))
+                    )
+                    transitions.append({
+                        "predecessor_ids": predecessor_ids,
+                        "successor_ids": student_decoded.detach().clone(),
+                        "answer_mask": answer_mask,
+                        "advanced_mask": advanced_mask,
+                    })
 
-    # One final successor state after all blocks have executed their configured
-    # number of rollout steps. The mask spans every block, not only the last.
-    remaining_mask = (student_decoded == mask_id) & (token_positions < valid_lengths.unsqueeze(1))
-    transitions = [{
-        "input_ids": student_decoded.clone(),
-        "remaining_mask": remaining_mask,
-    }]
+    if not transition_csm:
+        # Preserve the old DMD path: one final successor state after all blocks
+        # have executed their configured student_decode_steps updates.
+        remaining_mask = (student_decoded == mask_id) & (token_positions < valid_lengths.unsqueeze(1))
+        transitions = [{
+            "input_ids": student_decoded.clone(),
+            "remaining_mask": remaining_mask,
+        }]
     return student_decoded, decoded_positions, transitions

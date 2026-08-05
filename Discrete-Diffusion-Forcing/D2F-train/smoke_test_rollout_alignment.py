@@ -23,6 +23,7 @@ from utils.on_policy_rollout import (
     _sample_tokens,
     _select_top1_position,
     student_blockwise_rollout,
+    student_blockwise_rollout_dmd,
 )
 
 
@@ -128,9 +129,74 @@ def test_full_rollout(device):
     print("  PASSED\n")
 
 
+def test_transition_csm_rollout(device):
+    print(f"=== test_transition_csm_rollout ({device}) ===")
+    torch.manual_seed(7)
+    vocab, d_model, L, mask_id = 32, 8, 12, 0
+    model = TinyLLada(vocab, d_model, L).to(device).eval()
+    with torch.no_grad():
+        model.proj.bias[mask_id] = -100.0
+
+    input_ids = torch.zeros(2, L, dtype=torch.long, device=device)
+    input_ids[0, :2] = torch.tensor([1, 2], device=device)
+    input_ids[1, :4] = torch.tensor([3, 4, 5, 6], device=device)
+    question_length = torch.tensor([2, 4], device=device)
+    lengths = torch.tensor([8, 12], device=device)
+
+    decoded, _, transitions = student_blockwise_rollout_dmd(
+        input_ids=input_ids,
+        student_model=model,
+        question_length=question_length,
+        block_size=3,
+        num_decode_steps=1,
+        mask_id=mask_id,
+        eos_id=mask_id,
+        temperature=0.0,
+        top_p=1.0,
+        device=device,
+        is_llada=False,
+        shift=True,
+        lengths=lengths,
+        transition_csm=True,
+    )
+
+    assert transitions, "transition CSM rollout produced no transitions"
+    positions = torch.arange(L, device=device).unsqueeze(0)
+    expected_answer_mask = (
+        (positions >= question_length.unsqueeze(1))
+        & (positions < lengths.unsqueeze(1))
+    )
+    for transition in transitions:
+        predecessor_ids = transition["predecessor_ids"]
+        successor_ids = transition["successor_ids"]
+        assert not predecessor_ids.requires_grad and predecessor_ids.grad_fn is None
+        assert not successor_ids.requires_grad and successor_ids.grad_fn is None
+        assert torch.equal(transition["answer_mask"], expected_answer_mask)
+        assert not transition["answer_mask"][positions < question_length.unsqueeze(1)].any()
+        assert not transition["answer_mask"][positions >= lengths.unsqueeze(1)].any()
+        expected_advanced_mask = predecessor_ids.ne(successor_ids).any(dim=1)
+        assert torch.equal(transition["advanced_mask"], expected_advanced_mask)
+        csm_mask = transition["answer_mask"] & transition["advanced_mask"][:, None]
+        assert torch.equal(csm_mask, expected_answer_mask & expected_advanced_mask[:, None])
+
+    assert any(not transition["advanced_mask"][0] for transition in transitions), (
+        "expected a variable-length transition where sample 0 is inactive"
+    )
+    assert (decoded[expected_answer_mask] != mask_id).any(), "no answer token was decoded"
+    assert torch.equal(decoded[~expected_answer_mask], input_ids[~expected_answer_mask]), (
+        "prompt or padding changed"
+    )
+    print(f"  {len(transitions)} detached transitions; answer mask excludes prompt/padding  ✅")
+    print("  PASSED\n")
+
+
 if __name__ == "__main__":
     test_sample_tokens()
     test_select_top1_position()
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    test_full_rollout(device)
+    test_full_rollout(torch.device("cpu"))
+    test_transition_csm_rollout(torch.device("cpu"))
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        test_full_rollout(device)
+        test_transition_csm_rollout(device)
     print("ALL SMOKE TESTS PASSED")

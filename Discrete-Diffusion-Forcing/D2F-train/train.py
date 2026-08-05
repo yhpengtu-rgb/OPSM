@@ -151,10 +151,11 @@ def main(args):
     # separate GPU).  The two are mutually exclusive.
     ema_lora = None
     dmd_loss = getattr(config.train, 'dmd_loss', False)
-    if dmd_loss:
+    transition_csm = getattr(config.train, 'transition_csm', False)
+    if dmd_loss or transition_csm:
         if async_pipeline is not None:
-            raise ValueError("dmd_loss and async_rollout_device are mutually exclusive "
-                             "(DMD needs differentiable rollout, async runs no_grad).")
+            raise ValueError("dmd_loss/transition_csm and async_rollout_device are mutually exclusive "
+                             "(transition CSM needs synchronous per-transition backward).")
         from utils.ema_lora import EMALoRA
         ema_decay = getattr(config.train, 'dmd_ema_decay', 0.999)
         ema_lora = EMALoRA(denoiser, decay=ema_decay)
@@ -205,6 +206,7 @@ def main(args):
                 rollout_results = rollout_results,
                 lengths       = lengths,
                 ema_lora      = ema_lora,
+                backward_callback = accelerator.backward if transition_csm else None,
             )
 
             if config.train.share_steps > 1:
@@ -214,7 +216,8 @@ def main(args):
             else:
                 raise NotImplementedError
             torch.cuda.empty_cache()
-            accelerator.backward(loss_tgt)
+            if not losses.get('backward_done', False):
+                accelerator.backward(loss_tgt)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(params_to_learn, 1.0)
 

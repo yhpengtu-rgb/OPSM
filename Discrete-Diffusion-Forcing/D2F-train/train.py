@@ -146,16 +146,18 @@ def main(args):
     # When dmd_loss is enabled, create an EMA copy of the LoRA adapter
     # weights.  The EMA model serves as the "fake" distribution in the
     # DMD density-ratio score: c = log p_teacher - log p_fake.
-    # NOTE: DMD rollout is differentiable (Gumbel-softmax) and CANNOT be
-    # used with the async pipeline (which runs rollout under no_grad on a
-    # separate GPU).  The two are mutually exclusive.
+    # On-policy losses construct their rollout synchronously so the active
+    # student weights and attention masks remain aligned with the loss.
     ema_lora = None
     dmd_loss = getattr(config.train, 'dmd_loss', False)
     transition_csm = getattr(config.train, 'transition_csm', False)
+    final_draft_remask = getattr(config.train, 'final_draft_remask', False)
     if dmd_loss or transition_csm:
         if async_pipeline is not None:
-            raise ValueError("dmd_loss/transition_csm and async_rollout_device are mutually exclusive "
-                             "(transition CSM needs synchronous per-transition backward).")
+            raise ValueError("dmd_loss/transition_csm and async_rollout_device are mutually exclusive.")
+    if final_draft_remask and async_pipeline is not None:
+        raise ValueError("final_draft_remask and async_rollout_device are mutually exclusive.")
+    if dmd_loss or transition_csm:
         from utils.ema_lora import EMALoRA
         ema_decay = getattr(config.train, 'dmd_ema_decay', 0.999)
         ema_lora = EMALoRA(denoiser, decay=ema_decay)
@@ -206,7 +208,7 @@ def main(args):
                 rollout_results = rollout_results,
                 lengths       = lengths,
                 ema_lora      = ema_lora,
-                backward_callback = accelerator.backward if transition_csm else None,
+                backward_callback = accelerator.backward if (transition_csm or final_draft_remask) else None,
             )
 
             if config.train.share_steps > 1:

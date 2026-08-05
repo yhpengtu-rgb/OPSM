@@ -375,20 +375,12 @@ def student_blockwise_rollout_dmd(
     shift: bool = True,
     lengths: Optional[torch.Tensor] = None,
     transition_csm: bool = False,
+    transition_sample_ratio: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
-    """Produce detached rollout states for DMD or per-step Transition-CSM.
+    """Produce a detached rollout and sampled block transitions for CSM.
 
-    Every block completes ``num_decode_steps`` top-1 unmask operations before
-    the sole transition record is created. Therefore ``transitions[-1]`` is
-    the state after the entire blockwise rollout, not an intermediate block or
-    decode-step state. ``compute_dmd_loss`` evaluates student, teacher and EMA
-    fake exactly once on its remaining masks using Concrete Score Matching.
-
-    Returns:
-        student_decoded: final hard rollout sequence.
-        decoded_positions: positions unmasked by the rollout.
-        transitions: a one-element list containing the final detached state
-            and its all-block remaining-mask tensor of shape [B, L].
+    ``transition_sample_ratio`` selects a uniform subset of rollout blocks.
+    At least one block is retained whenever the rollout has any block.
     """
     B, L = input_ids.shape
     if device is None:
@@ -414,6 +406,19 @@ def student_blockwise_rollout_dmd(
     max_blocks = max(total_blocks) if total_blocks else 0
 
     transitions: List[Dict[str, torch.Tensor]] = []
+    if transition_csm and max_blocks:
+        transition_sample_ratio = float(transition_sample_ratio)
+        sampled_block_count = max(1, int(max_blocks * transition_sample_ratio))
+        sampled_block_count = min(max_blocks, sampled_block_count)
+        sampled_blocks = torch.randperm(max_blocks, device=device)[:sampled_block_count]
+        sampled_blocks = set(sampled_blocks.cpu().tolist())
+    else:
+        sampled_blocks = set()
+
+    answer_mask = (
+        (token_positions >= prompt_lengths.unsqueeze(1))
+        & (token_positions < valid_lengths.unsqueeze(1))
+    )
 
     attention_mask_full = build_custom_float_attention_mask(
         student_decoded, prompt_lengths, block_size, device=device
@@ -448,8 +453,11 @@ def student_blockwise_rollout_dmd(
             end = min(start + block_size, int(valid_lengths[i].item()))
             block_ranges[i] = (start, end)
 
-        # Each decode step retains one differentiable rollout forward and
-        # fills one top-1 position. Stop early only if every active block is full.
+        selected_block = transition_csm and block_idx in sampled_blocks
+        if selected_block:
+            predecessor_ids = student_decoded.detach().clone()
+
+        # Each decode step runs one rollout forward and fills one top-1 position.
         for _ in range(num_decode_steps):
             active_with_masks = [
                 i for i in active
@@ -482,22 +490,18 @@ def student_blockwise_rollout_dmd(
                     ))
                     decoded_positions[i, pos] = True
 
-                predecessor_ids = student_decoded.detach().clone()
-                advanced_mask = torch.zeros(B, dtype=torch.bool, device=device)
-                advanced_mask[active_with_masks] = True
                 student_decoded = _apply_assignments(student_decoded, assignments)
                 student_decoded_sub = student_decoded[:, :max_needed]
-                if transition_csm:
-                    answer_mask = (
-                        (token_positions >= prompt_lengths.unsqueeze(1))
-                        & (token_positions < valid_lengths.unsqueeze(1))
-                    )
-                    transitions.append({
-                        "predecessor_ids": predecessor_ids,
-                        "successor_ids": student_decoded.detach().clone(),
-                        "answer_mask": answer_mask,
-                        "advanced_mask": advanced_mask,
-                    })
+
+        if selected_block:
+            advanced_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            advanced_mask[active] = True
+            transitions.append({
+                "predecessor_ids": predecessor_ids,
+                "successor_ids": student_decoded.detach().clone(),
+                "answer_mask": answer_mask,
+                "advanced_mask": advanced_mask,
+            })
 
     if not transition_csm:
         # Preserve the old DMD path: one final successor state after all blocks

@@ -1,10 +1,9 @@
-# Per-hard-transition Concrete Score Matching on on-policy LLaDA rollouts.
-# This preserves llada_on_policy_dmd.yaml's legacy final-successor DMD mode.
+# Final-draft confidence-guided teacher correction for on-policy LLaDA.
 training_mode: 'llada'
 
 paths:
   model: "/inspire/ssd/project/sais-bio/public/tupeng/Discrete-Diffusion-Forcing-main/LLaDA-8B-Instruct"
-  experiment: "ckpt_llada_instruct_on_policy_transition_csm"
+  experiment: "ckpt_llada_instruct_on_policy_final_draft_remask"
   data:
     bs: "/inspire/ssd/project/sais-bio/public/tupeng/Lansechen/bs17k_collection_filtered_hard_maxlength600"
     bs_easy: "/inspire/ssd/project/sais-bio/public/tupeng/Lansechen/bs17k_collection_filtered_easy_maxlength600"
@@ -28,12 +27,11 @@ denoiser:
 
 train:
   distillation_mode: "on-policy"
-  transition_csm: true
-  # Uniformly sample this fraction of total rollout blocks for CSM; at least one.
-  transition_sample_ratio: 0.1
+  transition_csm: false
   dmd_loss: false
-  dmd_ema_decay: 0.999
-  aux_remaining_weight: 0.1
+  final_draft_remask: true
+  final_draft_remask_ratio: 0.25
+  aux_remaining_weight: 0.0
   student_decode_steps: 1
   teacher_rollout_steps: 1
   temperature: 0.8
@@ -43,9 +41,9 @@ train:
   head_resume_path:
   skipped_keys:
   global_step:
-  exp_name: &exp_name "llada_ddt_on_policy_transition_csm"
+  exp_name: &exp_name "llada_ddt_on_policy_final_draft_remask"
   wandb_proj: *exp_name
-  output_dir: "ddt_on_policy_transition_csm"
+  output_dir: "ddt_on_policy_final_draft_remask"
   logging_dir: "logs"
   mixed_precision: "fp16"
   gradient_accumulation_steps: 2

@@ -150,32 +150,24 @@ def shift_logits(logits):
     return shifted_logits
 
 def build_custom_float_attention_mask(input_ids, prompt_length, block_size, device=None):
-    B,seq_len= input_ids.shape
-    # Initialize with -inf (no attention allowed)
-    attn_mask = torch.full((B,1,seq_len, seq_len), float('-inf'), dtype=torch.float32, device=device)
-    # 1. Prompt part: each token can attend to the entire prompt
-    for i in range(B):
-        attn_mask[i,:,:,:prompt_length[i]] = 0.0  # Allow all tokens to see prompt
+    """Build the block-causal mask without Python loops over samples/blocks."""
+    batch_size, seq_len = input_ids.shape
+    if device is None:
+        device = input_ids.device
+    prompt_length = prompt_length.to(device=device, dtype=torch.long).clamp(0, seq_len)
+    positions = torch.arange(seq_len, device=device)
+    query_positions = positions.view(1, seq_len, 1)
+    key_positions = positions.view(1, 1, seq_len)
+    prompt = prompt_length.view(batch_size, 1, 1)
 
-        # 2. Block division: divide blocks starting from prompt_length
-        num_blocks = (seq_len - prompt_length[i] + block_size - 1) // block_size
-
-        for b in range(num_blocks):
-            block_start = prompt_length[i] + b * block_size
-            block_end = min(block_start + block_size, seq_len)
-
-            # Full attention within block
-            attn_mask[i,:,block_start:block_end, block_start:block_end] = 0.0
-
-            # Causal attention between blocks (can only see previous blocks)
-            for prev_b in range(b):
-                prev_start = prompt_length[i] + prev_b * block_size
-                prev_end = min(prev_start + block_size, seq_len)
-
-                # Current block can see previous blocks
-                attn_mask[i,:,block_start:block_end, prev_start:prev_end] = 0.0
-
-    return attn_mask
+    query_is_answer = query_positions >= prompt
+    key_is_prompt = key_positions < prompt
+    query_block = torch.div((query_positions - prompt).clamp_min(0), block_size, rounding_mode='floor')
+    key_block = torch.div((key_positions - prompt).clamp_min(0), block_size, rounding_mode='floor')
+    allowed = key_is_prompt | (query_is_answer & (key_positions >= prompt) & (key_block <= query_block))
+    return torch.zeros((batch_size, 1, seq_len, seq_len), dtype=torch.float32, device=device).masked_fill(
+        ~allowed.unsqueeze(1), float('-inf')
+    )
 
 if __name__ == '__main__':
     input_ids= torch.tensor([[1,5,4,3,25,6,7,9,5,8,7,6],[1,3,8,9,7,34,6,9,5,8,7,6]])

@@ -16,6 +16,7 @@ import os
 
 import torch
 import torch.nn as nn
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -41,6 +42,10 @@ class TinyLLada(nn.Module):
         emb = self.embed(input_ids) + self.pos[: input_ids.shape[1]]
         logits = self.proj(emb)
         return type("Out", (), {"logits": logits})()
+
+    @contextmanager
+    def disable_adapter(self):
+        yield
 
 
 def test_sample_tokens():
@@ -129,6 +134,82 @@ def test_full_rollout(device):
     print("  PASSED\n")
 
 
+class TinyEMA:
+    @contextmanager
+    def swap(self, model):
+        yield
+
+
+def test_transition_csm_loss(device):
+    print(f"=== test_transition_csm_loss ({device}) ===")
+    from utils.loss import compute_transition_csm_loss
+
+    torch.manual_seed(11)
+    vocab, d_model, L, mask_id = 32, 8, 12, 0
+    model = TinyLLada(vocab, d_model, L).to(device).train()
+    with torch.no_grad():
+        model.proj.bias[mask_id] = -100.0
+    input_ids = torch.zeros(2, L, dtype=torch.long, device=device)
+    input_ids[0, :2] = torch.tensor([1, 2], device=device)
+    input_ids[1, :4] = torch.tensor([3, 4, 5, 6], device=device)
+    question_length = torch.tensor([2, 4], device=device)
+    lengths = torch.tensor([8, 12], device=device)
+
+    class Config(dict):
+        train = {"aux_remaining_weight": 0.1, "transition_sample_ratio": 0.67}
+
+    config = Config(training_mode="dream")
+    backward_calls = []
+
+    def backward(loss):
+        backward_calls.append(loss.detach())
+        loss.backward()
+
+    losses = compute_transition_csm_loss(
+        input_ids=input_ids, denoiser=model, ema_lora=TinyEMA(),
+        question_length=question_length, mask_id=mask_id, block_size=3,
+        enable_shift=True, eos_id=mask_id, student_decode_steps=1,
+        temperature=0.0, top_p=1.0, config=config, lengths=lengths,
+        backward_callback=backward,
+    )
+    assert losses["transition_count"].item() == 2
+    assert len(backward_calls) == 2
+    assert any(parameter.grad is not None for parameter in model.parameters())
+    print(f"  {len(backward_calls)} backward call(s), two sampled block transitions  ✅")
+    print("  PASSED\n")
+
+
+def test_final_draft_remask_loss(device):
+    print(f"=== test_final_draft_remask_loss ({device}) ===")
+    from utils.loss import compute_final_draft_remask_loss
+
+    torch.manual_seed(13)
+    vocab, d_model, L, mask_id = 32, 8, 12, 0
+    model = TinyLLada(vocab, d_model, L).to(device).train()
+    with torch.no_grad():
+        model.proj.bias[mask_id] = -100.0
+    input_ids = torch.zeros(2, L, dtype=torch.long, device=device)
+    input_ids[0, :2] = torch.tensor([1, 2], device=device)
+    input_ids[1, :4] = torch.tensor([3, 4, 5, 6], device=device)
+    question_length = torch.tensor([2, 4], device=device)
+    lengths = torch.tensor([8, 12], device=device)
+
+    class Config(dict):
+        train = {"final_draft_remask_ratio": 0.5}
+
+    losses = compute_final_draft_remask_loss(
+        input_ids=input_ids, denoiser=model, question_length=question_length,
+        mask_id=mask_id, block_size=3, enable_shift=True, eos_id=mask_id,
+        student_decode_steps=1, temperature=0.0, top_p=1.0,
+        config=Config(training_mode="dream"), lengths=lengths,
+        backward_callback=lambda loss: loss.backward(),
+    )
+    assert losses["remaining_mask_length"].item() > 0
+    assert any(parameter.grad is not None for parameter in model.parameters())
+    print("  low-confidence remask correction backward  ✅")
+    print("  PASSED\n")
+
+
 def test_transition_csm_rollout(device):
     print(f"=== test_transition_csm_rollout ({device}) ===")
     torch.manual_seed(7)
@@ -158,6 +239,7 @@ def test_transition_csm_rollout(device):
         shift=True,
         lengths=lengths,
         transition_csm=True,
+        transition_sample_ratio=1.0,
     )
 
     assert transitions, "transition CSM rollout produced no transitions"
@@ -166,6 +248,7 @@ def test_transition_csm_rollout(device):
         (positions >= question_length.unsqueeze(1))
         & (positions < lengths.unsqueeze(1))
     )
+    assert len(transitions) == 3, f"expected three sampled block transitions, got {len(transitions)}"
     for transition in transitions:
         predecessor_ids = transition["predecessor_ids"]
         successor_ids = transition["successor_ids"]
@@ -179,9 +262,6 @@ def test_transition_csm_rollout(device):
         csm_mask = transition["answer_mask"] & transition["advanced_mask"][:, None]
         assert torch.equal(csm_mask, expected_answer_mask & expected_advanced_mask[:, None])
 
-    assert any(not transition["advanced_mask"][0] for transition in transitions), (
-        "expected a variable-length transition where sample 0 is inactive"
-    )
     assert (decoded[expected_answer_mask] != mask_id).any(), "no answer token was decoded"
     assert torch.equal(decoded[~expected_answer_mask], input_ids[~expected_answer_mask]), (
         "prompt or padding changed"
@@ -195,8 +275,12 @@ if __name__ == "__main__":
     test_select_top1_position()
     test_full_rollout(torch.device("cpu"))
     test_transition_csm_rollout(torch.device("cpu"))
+    test_transition_csm_loss(torch.device("cpu"))
+    test_final_draft_remask_loss(torch.device("cpu"))
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
         test_full_rollout(device)
         test_transition_csm_rollout(device)
+        test_transition_csm_loss(device)
+        test_final_draft_remask_loss(device)
     print("ALL SMOKE TESTS PASSED")

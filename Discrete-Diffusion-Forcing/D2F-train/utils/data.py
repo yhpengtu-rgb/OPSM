@@ -266,9 +266,11 @@ def get_bs17k_dataloader(tokenizer, config, max_length=1024):
     dataloader = DataLoader(
         dataset,
         batch_size  = config.batch_size,
-        num_workers = 0,
+        num_workers = config.num_workers,
         shuffle     = True,
         pin_memory  = True,
+        prefetch_factor = 2,
+        persistent_workers=True,
     )
 
     return dataloader
@@ -380,9 +382,11 @@ def get_llada_bs17k_dataloader(tokenizer, config, max_length=1024):
         dataset,
         batch_size  = config.batch_size,
         collate_fn  = lambda x: collate_fn_dynamic(x, pad_id, block_size=block_size),
-        num_workers = 0,
+        num_workers = config.num_workers,
         shuffle     = True,
         pin_memory  = True,
+        prefetch_factor = 2,
+        persistent_workers = True,
     )
 
     return dataloader

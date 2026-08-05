@@ -1,0 +1,24 @@
+{
+    "configurations": [
+
+        {
+            "name": "Debug LLada Train (Accelerate)",
+            "type": "python",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "args": [
+                "--config_file", "config/acc_config",
+                "--num_processes", "1",
+                "--main_process_port", "29579",
+                "train.py",
+                "--config", "config/llada_on_policy_dmd.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "/inspire/ssd/project/sais-bio/public/tupeng/OPSM/Discrete-Diffusion-Forcing/D2F-train",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

@@ -1,0 +1,77 @@
+# Joint-action DMD-style on-policy distillation config.
+# `dmd_joint_action` builds a simplified CSM joint denoising action
+# (position, token). Position score is max token log-probability
+# (`token_log_probs.max`), matching the existing confidence-based position
+# selection; it is not an exact full-sequence score.
+training_mode: 'llada'
+
+paths:
+  model: "/home/cw/workspace/Discrete-Diffusion-Forcing-main/LLaDA-8B-Instruct"
+  experiment: "ckpt_llada_instruct_on_policy_dmd"
+  data:
+    bs: "Lansechen/bs17k_collection_filtered_hard_maxlength600"
+    bs_easy: "Lansechen/bs17k_collection_filtered_easy_maxlength600"
+
+denoiser:
+  encoder:
+    name: "llada"
+    mask_id: 126336
+
+  decoder:
+    wiinit: true
+    name: "eagle_rope"
+    num_blocks: 1
+    seq_len: &seq_len 128
+    input_dim: 3584
+    hidden_dim: &dim 3584
+    vocab_size: 152064
+    block:
+      seq_len: *seq_len
+      hidden_dim: *dim
+      num_heads: 32
+
+train:
+  distillation_mode: "on-policy"
+  dmd_loss: true               # enable DMD-style loss
+  dmd_ema_decay: 0.999         # EMA fake model decay rate
+  dmd_grad_checkpoint: false  # rollout is detached; successor DMD uses fresh forwards
+  aux_remaining_weight: 0.0   # optional ground-truth masked-token auxiliary loss
+  dmd_joint_action: true      # use simplified joint CSM denoising action (position, token)
+  dmd_position_temperature: 1.0
+  dmd_token_temperature: 1.0
+  student_decode_steps: 1
+  teacher_rollout_steps: 1
+  # Teacher uses disable_adapter() (base model) + full bidirectional attention
+  # (torch.zeros([1,1,L,L])), matching the original D2F ref_logits path.
+  # No teacher_block_size config needed — the teacher always sees the full
+  # sequence regardless of seq_len.
+  temperature: 0.8
+  top_p: 0.95
+  async_rollout_device:        # MUST be empty for DMD (differentiable rollout)
+  decoder_resume_path:
+  head_resume_path:
+  skipped_keys:
+  global_step:
+  exp_name: &exp_name "llada_ddt_on_policy_joint_dmd"
+  wandb_proj: *exp_name
+  output_dir: "ddt_on_policy_joint_dmd"
+  logging_dir: "logs"
+  mixed_precision: "fp16"
+  gradient_accumulation_steps: 2
+  report_to: "no"
+  block_size: 16
+  lr: 1e-5
+  num_iters: 100
+  num_epochs:
+  eval_every: 100000
+  save_every: 100000
+  enable_shift: true
+  share_steps: 2
+  self_align: true
+  feature_align: false
+  self_step: true
+
+data:
+  name: "bs17k"
+  batch_size: 1          # dynamic padding + gradient_accumulation
+  max_length: 50

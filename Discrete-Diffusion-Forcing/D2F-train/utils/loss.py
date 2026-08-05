@@ -427,22 +427,65 @@ def compute_dmd_loss(
     if shift:
         student_logits_full = shift_logits(student_logits_full)
 
-    if successor_mask.any():
-        student_logits = student_logits_full[successor_mask]
-        teacher_logits = teacher_logits[successor_mask].float()
-        fake_logits = fake_logits[successor_mask].float()
+    dmd_joint_action = config.train.get('dmd_joint_action', False) if config is not None else False
+    if dmd_joint_action:
+        position_temperature = config.train.get('dmd_position_temperature', 1.0)
+        token_temperature = config.train.get('dmd_token_temperature', 1.0)
+        if position_temperature <= 0 or token_temperature <= 0:
+            raise ValueError("dmd_position_temperature and dmd_token_temperature must be positive")
 
-        # Concrete score matching: student probabilities provide the measure;
-        # EMA fake minus teacher defines the detached DMD score vector field.
-        student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
-        fake_mean = (student_probs * fake_logits).sum(dim=-1, keepdim=True)
-        teacher_mean = (student_probs * teacher_logits).sum(dim=-1, keepdim=True)
-        fake_score = fake_logits - fake_mean
-        teacher_score = teacher_logits - teacher_mean
-        grad_coeff = 2.0 * student_probs * (fake_score - teacher_score)
-        loss_transition = (
-            grad_coeff.detach() * student_logits.float()
-        ).sum(dim=-1).mean()
+    if successor_mask.any():
+        if dmd_joint_action:
+            joint_losses = []
+            for batch_idx in range(B):
+                sample_mask = successor_mask[batch_idx]
+                if not sample_mask.any():
+                    continue
+
+                student_logits = student_logits_full[batch_idx, sample_mask].float()
+                teacher_sample_logits = teacher_logits[batch_idx, sample_mask].float()
+                fake_sample_logits = fake_logits[batch_idx, sample_mask].float()
+
+                student_token_log_pi = F.log_softmax(student_logits / token_temperature, dim=-1)
+                teacher_token_log_pi = F.log_softmax(teacher_sample_logits / token_temperature, dim=-1)
+                fake_token_log_pi = F.log_softmax(fake_sample_logits / token_temperature, dim=-1)
+
+                student_pos_log_pi = F.log_softmax(
+                    student_token_log_pi.max(dim=-1).values / position_temperature, dim=0
+                )
+                teacher_pos_log_pi = F.log_softmax(
+                    teacher_token_log_pi.max(dim=-1).values / position_temperature, dim=0
+                )
+                fake_pos_log_pi = F.log_softmax(
+                    fake_token_log_pi.max(dim=-1).values / position_temperature, dim=0
+                )
+
+                student_joint_log_pi = student_pos_log_pi[:, None] + student_token_log_pi
+                teacher_joint_log_pi = teacher_pos_log_pi[:, None] + teacher_token_log_pi
+                fake_joint_log_pi = fake_pos_log_pi[:, None] + fake_token_log_pi
+                student_joint_prob = student_joint_log_pi.exp().detach()
+                delta = fake_joint_log_pi - teacher_joint_log_pi
+                center = (student_joint_prob * delta).sum()
+                grad_coeff = 2.0 * student_joint_prob * (delta - center)
+                joint_losses.append((grad_coeff.detach() * student_joint_log_pi).sum())
+
+            loss_transition = torch.stack(joint_losses).mean()
+        else:
+            student_logits = student_logits_full[successor_mask]
+            teacher_logits = teacher_logits[successor_mask].float()
+            fake_logits = fake_logits[successor_mask].float()
+
+            # Concrete score matching: student probabilities provide the measure;
+            # EMA fake minus teacher defines the detached DMD score vector field.
+            student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
+            fake_mean = (student_probs * fake_logits).sum(dim=-1, keepdim=True)
+            teacher_mean = (student_probs * teacher_logits).sum(dim=-1, keepdim=True)
+            fake_score = fake_logits - fake_mean
+            teacher_score = teacher_logits - teacher_mean
+            grad_coeff = 2.0 * student_probs * (fake_score - teacher_score)
+            loss_transition = (
+                grad_coeff.detach() * student_logits.float()
+            ).sum(dim=-1).mean()
     else:
         loss_transition = student_logits_full[0, 0, 0] * 0.0
 

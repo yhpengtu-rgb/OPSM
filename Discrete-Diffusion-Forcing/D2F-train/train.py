@@ -160,6 +160,15 @@ def main(args):
         ema_lora = EMALoRA(denoiser, decay=ema_decay)
         print(f'[dmd] EMA LoRA fake model (decay={ema_decay})')
 
+    def save_checkpoint(name):
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            denoiser.eval()
+            accelerator.unwrap_model(denoiser).save_pretrained(
+                os.path.join(output_dir, name)
+            )
+        accelerator.wait_for_everyone()
+
     # --- Per-step training closure ---------------------------------------
     # Extracted so the async-pipeline loop can train on the *previously*
     # fetched batch (whose rollout result is in hand) while the *next* batch
@@ -225,15 +234,18 @@ def main(args):
         if accelerator.sync_gradients:
             global_step += 1
             progress_bar.update(1)
-            logs = dict()
-            loss_tgt = accelerator.gather(loss_tgt.detach()).mean().item()
-            logs['loss'] = loss_tgt
-            # if config.train.share_steps > 1:
-            #     loss_1 = accelerator.gather(loss_1.detach()).mean().item()
-            #     loss_2 = accelerator.gather(loss_2.detach()).mean().item()
-                # logs['loss_1'] = loss_1
-                # logs['loss_2'] = loss_2
 
+            def gather_loss(name):
+                value = losses.get(name)
+                if value is None:
+                    value = torch.zeros((), device=loss_tgt.device)
+                return accelerator.gather(value.detach()).mean().item()
+
+            logs = {
+                'total_loss': gather_loss('loss'),
+                'dmd_loss': gather_loss('transition_dmd_loss'),
+                'ce_loss': gather_loss('aux_remaining_loss'),
+            }
             accelerator.log(logs, step=global_step)
             progress_bar.set_postfix(**logs)
 
@@ -282,14 +294,12 @@ def main(args):
             answer = tokenizer.batch_decode(x_t[:, prompt.shape[1]:], skip_special_tokens=True)[0]
             print(answer)
 
-        accelerator.wait_for_everyone()
-
-        if global_step > 0 and global_step % config.train.save_every == 0 and accelerator.is_main_process:
-            denoiser.eval()
-            decoder_state_dict = accelerator.unwrap_model(denoiser).save_pretrained(os.path.join(output_dir, f"Decoder-{config.train.exp_name}-{global_step // 1000}k"))
-            # lmhead_state_dict = accelerator.unwrap_model(denoiser).lm_head.state_dict()
-            # torch.save(lmhead_state_dict, os.path.join(output_dir, f"LMhead-{config.train.exp_name}-{global_step // 1000}k"))
-        accelerator.wait_for_everyone()
+        if (
+            accelerator.sync_gradients
+            and global_step > 0
+            and global_step % config.train.save_every == 0
+        ):
+            save_checkpoint(f"Decoder-{config.train.exp_name}-{global_step // 1000}k")
         # Stop if we've reached the iteration cap (if set)
         if num_iters_cap is not None and global_step >= num_iters_cap:
             training_done = True
@@ -337,7 +347,12 @@ def main(args):
                 rollout_results = None
             train_one_step(pending_batch, rollout_results)
 
+        completed_epoch = not broke_early
         epoch += 1
+        if completed_epoch:
+            save_checkpoint(
+                f"Decoder-{config.train.exp_name}-epoch-{epoch}-step-{global_step}"
+            )
         # Stop if we've completed all epochs (if num_epochs is set)
         if num_epochs is not None and epoch >= num_epochs:
             training_done = True

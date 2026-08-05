@@ -376,26 +376,34 @@ def compute_dmd_loss(
         device=device,
         is_llada=is_llada,
         shift=shift,
+        lengths=lengths,
     )
 
     # Step 2: Compute Concrete DMD once on the final rollout state.
     # Teacher is full-bidirectional; fake and student use block-causal masks.
     if lengths is not None:
+        valid_lengths = lengths.to(device=device, dtype=torch.long).clamp(0, L)
         token_positions = torch.arange(L, device=device).unsqueeze(0)
-        valid_mask = token_positions < lengths.to(device).unsqueeze(1)
+        valid_mask = token_positions < valid_lengths.unsqueeze(1)
     else:
+        valid_lengths = torch.full((B,), L, dtype=torch.long, device=device)
         valid_mask = torch.ones((B, L), dtype=torch.bool, device=device)
 
     final_transition = transitions[-1]
     successor_ids = final_transition["input_ids"]
     successor_mask = final_transition["remaining_mask"] & valid_mask
 
+    prompt_lengths = question_length.to(device=device, dtype=torch.long).clamp(0, L)
+    prompt_lengths = torch.minimum(prompt_lengths, valid_lengths)
     attention_mask_student = build_custom_float_attention_mask(
-        successor_ids, question_length, block_size, device=device
+        successor_ids, prompt_lengths, block_size, device=device
     ).to(torch.float16)
-    attention_mask_teacher = torch.zeros(
-        [1, 1, L, L], dtype=torch.float16, device=device
+    attention_mask_student = attention_mask_student.masked_fill(
+        ~valid_mask[:, None, None, :], float('-inf')
     )
+    attention_mask_teacher = torch.zeros(
+        [B, 1, L, L], dtype=torch.float16, device=device
+    ).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
     student_kwargs = (
         {"attention_bias": attention_mask_student} if is_llada
         else {"attention_mask": attention_mask_student}

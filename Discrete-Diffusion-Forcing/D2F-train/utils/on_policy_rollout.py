@@ -373,6 +373,7 @@ def student_blockwise_rollout_dmd(
     device: Optional[torch.device] = None,
     is_llada: bool = False,
     shift: bool = True,
+    lengths: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
     """Produce a detached final rollout state for successor-state DMD.
 
@@ -396,19 +397,29 @@ def student_blockwise_rollout_dmd(
 
     student_decoded = input_ids.clone()
     token_positions = torch.arange(L, device=device).expand(B, L)
-    prompt_mask = token_positions < question_length.unsqueeze(1)
+    if lengths is None:
+        valid_lengths = torch.full((B,), L, device=device, dtype=torch.long)
+    else:
+        valid_lengths = lengths.to(device=device, dtype=torch.long).clamp(0, L)
+    prompt_lengths = question_length.to(device=device, dtype=torch.long).clamp(0, L)
+    prompt_lengths = torch.minimum(prompt_lengths, valid_lengths)
+    prompt_mask = token_positions < prompt_lengths.unsqueeze(1)
     student_decoded[~prompt_mask] = mask_id
     decoded_positions = torch.zeros_like(input_ids, dtype=torch.bool)
 
-    prompt_lens = [int(question_length[i].item()) for i in range(B)]
-    non_prompt_lens = [L - pl for pl in prompt_lens]
+    prompt_lens = [int(prompt_lengths[i].item()) for i in range(B)]
+    non_prompt_lens = [int(valid_lengths[i].item()) - pl for i, pl in enumerate(prompt_lens)]
     total_blocks = [(npl + block_size - 1) // block_size for npl in non_prompt_lens]
     max_blocks = max(total_blocks) if total_blocks else 0
 
     transitions: List[Dict[str, torch.Tensor]] = []
 
     attention_mask_full = build_custom_float_attention_mask(
-        student_decoded, question_length, block_size, device=device
+        student_decoded, prompt_lengths, block_size, device=device
+    )
+    valid_mask = token_positions < valid_lengths.unsqueeze(1)
+    attention_mask_full = attention_mask_full.masked_fill(
+        ~valid_mask[:, None, None, :], float('-inf')
     )
 
     def _fwd(ids, attn_bias):
@@ -433,7 +444,7 @@ def student_blockwise_rollout_dmd(
         block_ranges = {}
         for i in active:
             start = prompt_lens[i] + block_idx * block_size
-            end = min(start + block_size, max_needed)
+            end = min(start + block_size, int(valid_lengths[i].item()))
             block_ranges[i] = (start, end)
 
         # Each decode step retains one differentiable rollout forward and
@@ -475,7 +486,7 @@ def student_blockwise_rollout_dmd(
 
     # One final successor state after all blocks have executed their configured
     # number of rollout steps. The mask spans every block, not only the last.
-    remaining_mask = student_decoded == mask_id
+    remaining_mask = (student_decoded == mask_id) & (token_positions < valid_lengths.unsqueeze(1))
     transitions = [{
         "input_ids": student_decoded.clone(),
         "remaining_mask": remaining_mask,

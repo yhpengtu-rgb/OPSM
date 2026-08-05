@@ -3,10 +3,10 @@
 Verifies:
 1. `_sample_tokens` returns confidence = sampled-token probability
    (no margin_confidence / neg_entropy branches).
-2. `_select_topk_positions` ranks masked positions by confidence and
-   decodes the top-k (k = num_decode_steps = step).
+2. `_select_top1_position` selects the highest-confidence masked position.
 3. The full `student_blockwise_rollout` runs end-to-end on a tiny model,
-   decoding exactly `num_decode_steps` positions per step within a block.
+   performing `num_decode_steps` forwards and decoding one token per block
+   per forward.
 
 Run:  python smoke_test_rollout_alignment.py
 """
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.on_policy_rollout import (
     _sample_tokens,
-    _select_topk_positions,
+    _select_top1_position,
     student_blockwise_rollout,
 )
 
@@ -62,29 +62,24 @@ def test_sample_tokens():
     print("  PASSED\n")
 
 
-def test_select_topk_positions():
-    print("=== test_select_topk_positions ===")
-    # 4 positions logits; position 2 is by far the most confident
+def test_select_top1_position():
+    print("=== test_select_top1_position ===")
+    # Position 2 has the highest sampled-token confidence.
     logits = torch.tensor([
-        [0.1, 0.2, 0.5],   # pos0
-        [0.4, 0.3, 0.3],   # pos1
-        [0.0, 0.0, 9.0],   # pos2  <- argmax prob ~1.0
-        [0.2, 0.2, 0.6],   # pos3
+        [0.1, 0.2, 0.5],
+        [0.4, 0.3, 0.3],
+        [0.0, 0.0, 9.0],
+        [0.2, 0.2, 0.6],
     ])
     mask = torch.tensor([True, True, True, True])
-    k = 2  # step = 2
-    pos = _select_topk_positions(logits, mask, k, temperature=0.0)
-    # top-2 by confidence must be pos2 (highest) and then next highest
-    assert pos[0].item() == 2, f"top1 should be pos2, got {pos.tolist()}"
-    assert len(pos) == k, f"expected {k} positions, got {len(pos)}"
-    print(f"  selected positions (k={k}): {pos.tolist()}  ✅")
+    pos = _select_top1_position(logits, mask, temperature=0.0)
+    assert pos.tolist() == [2], f"top-1 should be pos2, got {pos.tolist()}"
+    print(f"  selected top-1 position: {pos.tolist()}  ✅")
 
-    # k clamped to number of masked positions
     mask2 = torch.tensor([True, False, True, False])
-    pos2 = _select_topk_positions(logits, mask2, 5, temperature=0.0)
-    assert len(pos2) == int(mask2.sum()), f"should clamp to masked count, got {pos2.tolist()}"
-    assert set(pos2.tolist()) == {0, 2}
-    print(f"  clamped positions: {pos2.tolist()}  ✅")
+    pos2 = _select_top1_position(logits, mask2, temperature=0.0)
+    assert pos2.tolist() == [2], f"masked top-1 should be pos2, got {pos2.tolist()}"
+    print(f"  masked top-1 position: {pos2.tolist()}  ✅")
     print("  PASSED\n")
 
 
@@ -92,7 +87,7 @@ def test_full_rollout(device):
     print(f"=== test_full_rollout ({device}) ===")
     torch.manual_seed(42)
     vocab, d_model, L, mask_id = 100, 16, 16, 0
-    block_size, steps = 4, 2  # each step decodes 2 positions in a block
+    block_size, steps = 4, 2  # two forwards; one decoded position per forward/block
 
     model = TinyLLada(vocab, d_model, L).to(device).eval()
 
@@ -120,17 +115,22 @@ def test_full_rollout(device):
 
     # prompt tokens must be preserved
     assert decoded[0, :4].tolist() == [1, 2, 3, 4], "prompt changed!"
-    # all 12 non-prompt positions must be decoded (no mask_id remains)
-    non_prompt = decoded[0, 4:]
-    assert (non_prompt != mask_id).all(), f"undecoded position remains: {non_prompt.tolist()}"
-    assert decoded_pos[0, 4:].all(), "some non-prompt positions not flagged decoded"
+    # There are three 4-token blocks after the prompt. Each block executes
+    # exactly `steps` forwards and decodes one top-1 token per forward.
+    non_prompt_decoded = int(decoded_pos[0, 4:].sum())
+    assert non_prompt_decoded == 3 * steps, (
+        f"expected {3 * steps} decoded positions, got {non_prompt_decoded}"
+    )
+    assert (decoded[0, 4:][decoded_pos[0, 4:]] != mask_id).all()
+    assert (decoded[0, 4:][~decoded_pos[0, 4:]] == mask_id).all()
     print(f"  decoded seq: {decoded[0].tolist()}")
-    print(f"  prompt preserved, all {int((non_prompt != mask_id).sum())} positions decoded  ✅")
+    print(f"  prompt preserved, {non_prompt_decoded} positions decoded  ✅")
     print("  PASSED\n")
 
 
 if __name__ == "__main__":
     test_sample_tokens()
-    test_select_topk_positions()
-    test_full_rollout()
-    print("ALL SMOKE TESTS PASSED 🎉")
+    test_select_top1_position()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    test_full_rollout(device)
+    print("ALL SMOKE TESTS PASSED")

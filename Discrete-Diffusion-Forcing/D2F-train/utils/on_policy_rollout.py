@@ -23,16 +23,17 @@ all prior tokens. A full forward pass per block iteration is required.
 
 Block-internal decoding (strictly aligned with eval_llada.py)
 --------------------------------------------------------------
-Within each block, positions are decoded by sampled-token confidence:
+Within each block, ``num_decode_steps`` controls the number of rollout
+forwards. Each forward decodes exactly one masked position:
 
-    for step in range(ceil(block_size / k)):
+    for _ in range(num_decode_steps):
         1. Forward pass → logits for ALL masked positions in the block
         2. _sample_tokens → confidence = probability of sampled token
            (NO margin_confidence / NO neg_entropy)
-        3. Select top-k positions by confidence  (k = num_decode_steps = step)
-        4. Sample and decode those k positions
-        5. Repeat until block has no more masked positions
+        3. Select the single highest-confidence masked position (top-1)
+        4. Sample and decode that position
 
+The remaining masked positions are intentionally retained for the loss.
 This mirrors ``_generate_block_single`` in ``D2F-eval/eval_llada.py`` and
 ``sample_tokens`` in ``model_cache/dream/generation_utils.py``.
 """
@@ -122,44 +123,25 @@ def _sample_tokens(
     return confidence, x0
 
 
-def _select_topk_positions(
+def _select_top1_position(
     logits: torch.Tensor,
     mask_in_block: torch.Tensor,
-    num_decode_steps: int,
     temperature: float = 0.0,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
 ) -> torch.Tensor:
-    """Select top-k masked positions by sampled-token confidence.
+    """Select one masked position by sampled-token confidence.
 
-    Aligned with eval_llada: confidence is the probability of the sampled
-    token (no margin_confidence / neg_entropy), then positions are sorted
-    by confidence and the top-k are decoded, where k = step
-    (num_decode_steps).
-
-    Args:
-        logits: [sub_L, vocab] logits for the block's subsequence.
-        mask_in_block: [sub_L] bool, True at masked positions within the block.
-        num_decode_steps: k, number of positions to select (the step).
-        temperature: sampling temperature.
-        top_p: nucleus filtering probability.
-        top_k: top-k logits filtering.
-
-    Returns:
-        decode_relative_positions: [k] positions (within the block's
-            subsequence) to decode, sorted by confidence descending.
+    ``student_decode_steps`` controls how many times this function is used
+    within a block; it is not a top-k width. Each rollout forward therefore
+    decodes only the highest-confidence masked position, matching eval_llada.
     """
     block_logits = logits[mask_in_block]  # [num_masked, vocab]
-
     confidence, _ = _sample_tokens(
         block_logits, temperature=temperature, top_p=top_p, top_k=top_k
-    )  # [num_masked]
-
-    k = min(num_decode_steps, int(mask_in_block.sum().item()))
-    _, topk_relative_idx = torch.topk(confidence, k)
-
+    )
     masked_relative_positions = torch.nonzero(mask_in_block, as_tuple=True)[0]
-    return masked_relative_positions[topk_relative_idx]
+    return masked_relative_positions[torch.argmax(confidence)].reshape(1)
 
 
 def _apply_assignments(
@@ -252,9 +234,9 @@ def student_blockwise_rollout(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Student model performs on-policy decoding within each block.
 
-    Within each block, positions are selected by confidence (negative
-    entropy) and decoded k at a time (k = num_decode_steps), matching
-    the original D2F inference algorithm.
+    Each block performs ``num_decode_steps`` rollout forwards. Every forward
+    selects one sampled-token-confidence top-1 position; remaining masked
+    positions are retained for the DMD remaining-position loss.
 
     Uses non-in-place tensor updates via _apply_assignments to prevent
     autograd issues with gradient checkpointing.
@@ -302,15 +284,14 @@ def student_blockwise_rollout(
             end = min(start + block_size, max_needed)
             block_ranges[i] = (start, end)
 
-        # Inner loop: decode positions by confidence until block is full
-        while True:
-            any_remaining = False
-            for i in active:
-                start_i, end_i = block_ranges[i]
-                if (student_decoded_sub[i, start_i:end_i] == mask_id).any():
-                    any_remaining = True
-                    break
-            if not any_remaining:
+        # Each decode step runs one forward and fills one top-1 position.
+        # Do not finish a block here: its remaining masks are supervised by loss.
+        for _ in range(num_decode_steps):
+            active_with_masks = [
+                i for i in active
+                if (student_decoded_sub[i, block_ranges[i][0]:block_ranges[i][1]] == mask_id).any()
+            ]
+            if not active_with_masks:
                 break
 
             with torch.no_grad():
@@ -319,34 +300,21 @@ def student_blockwise_rollout(
                 if shift:
                     logits = shift_logits(logits)
 
-            # Collect all assignments for this iteration, then apply them
             assignments: List[_DecodeAssignment] = []
-
-            for i in active:
+            for i in active_with_masks:
                 start_i, end_i = block_ranges[i]
-                block_slice = student_decoded_sub[i, start_i:end_i]
-                mask_in_block = (block_slice == mask_id)
+                mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
+                decode_relative = _select_top1_position(
+                    logits[i, start_i:end_i], mask_in_block,
+                    temperature=temperature, top_p=top_p,
+                )
+                pos = start_i + decode_relative.item()
+                _, token = _sample_tokens(logits[i, pos, :].unsqueeze(0), temperature, top_p)
+                assignments.append(_DecodeAssignment(
+                    batch_idx=i, position=pos, token_id=token.squeeze()
+                ))
+                decoded_positions[i, pos] = True
 
-                if not mask_in_block.any():
-                    continue
-
-                with torch.no_grad():
-                    decode_relative = _select_topk_positions(
-                        logits[i, start_i:end_i], mask_in_block, num_decode_steps,
-                        temperature=temperature, top_p=top_p,
-                    )
-
-                for rel_pos in decode_relative:
-                    pos = start_i + rel_pos.item()
-                    current_logits = logits[i, pos, :].unsqueeze(0)
-                    _, token = _sample_tokens(current_logits, temperature, top_p)
-                    token = token.squeeze()
-                    assignments.append(_DecodeAssignment(
-                        batch_idx=i, position=pos, token_id=token
-                    ))
-                    decoded_positions[i, pos] = True
-
-            # Apply all assignments safely (no in-place)
             student_decoded = _apply_assignments(student_decoded, assignments)
             student_decoded_sub = student_decoded[:, :max_needed]
 
@@ -415,9 +383,8 @@ def student_blockwise_rollout_dmd(
     index, stop-gradient).  The gradient flows through y1 directly —
     NOT through the sampling operation.
 
-    Within each block, positions are selected by confidence (negative
-    entropy) and decoded k at a time (k = num_decode_steps), matching
-    the original D2F inference algorithm.
+    Each block performs ``num_decode_steps`` differentiable forwards. Each
+    forward selects and decodes one sampled-token-confidence top-1 position.
 
     Uses non-in-place tensor updates via _apply_assignments to prevent
     autograd issues with gradient checkpointing.
@@ -476,24 +443,19 @@ def student_blockwise_rollout_dmd(
             end = min(start + block_size, max_needed)
             block_ranges[i] = (start, end)
 
-        # Inner loop: decode positions by confidence until block is full
-        while True:
-            any_remaining = False
-            for i in active:
-                start_i, end_i = block_ranges[i]
-                if (student_decoded_sub[i, start_i:end_i] == mask_id).any():
-                    any_remaining = True
-                    break
-            if not any_remaining:
+        # Each decode step retains one differentiable rollout forward and
+        # fills one top-1 position. Stop early only if every active block is full.
+        for _ in range(num_decode_steps):
+            active_with_masks = [
+                i for i in active
+                if (student_decoded_sub[i, block_ranges[i][0]:block_ranges[i][1]] == mask_id).any()
+            ]
+            if not active_with_masks:
                 break
 
-            # IMPORTANT: Make a contiguous copy of the sub-tensor before
-            # passing to gradient checkpointing. This prevents issues when
-            # the original tensor is later modified (via index_put_)
-            # between the checkpointed forward and its recomputation.
+            # Keep a standalone checkpoint input because student_decoded is
+            # replaced after this forward, before checkpoint recomputation.
             fwd_input = student_decoded_sub.clone()
-
-            # Forward pass (WITH GRAD + optional gradient checkpointing)
             if use_grad_checkpoint:
                 outputs = torch.utils.checkpoint.checkpoint(
                     _fwd, fwd_input, attention_mask_sub,
@@ -502,49 +464,31 @@ def student_blockwise_rollout_dmd(
             else:
                 outputs = _fwd(fwd_input, attention_mask_sub)
 
-            logits = outputs.logits  # [B, sub_L, vocab] — WITH grad
+            logits = outputs.logits
             if shift:
                 logits = shift_logits(logits)
 
-            # Collect all assignments for this iteration
             assignments: List[_DecodeAssignment] = []
-
-            for i in active:
+            for i in active_with_masks:
                 start_i, end_i = block_ranges[i]
-                block_slice = student_decoded_sub[i, start_i:end_i]
-                mask_in_block = (block_slice == mask_id)
-
-                if not mask_in_block.any():
-                    continue
-
-                # Select top-k positions by confidence (detached)
+                mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
                 with torch.no_grad():
-                    decode_relative = _select_topk_positions(
-                        logits[i, start_i:end_i].detach(),
-                        mask_in_block,
-                        num_decode_steps,
+                    decode_relative = _select_top1_position(
+                        logits[i, start_i:end_i].detach(), mask_in_block,
                         temperature=temperature, top_p=top_p,
                     )
+                pos = start_i + decode_relative.item()
+                current_logits = logits[i, pos, :]
+                with torch.no_grad():
+                    _, token_id = _sample_tokens(
+                        current_logits.detach().unsqueeze(0), temperature, top_p,
+                    )
+                assignments.append(_DecodeAssignment(
+                    batch_idx=i, position=pos, token_id=token_id.squeeze()
+                ))
+                decoded_positions[i, pos] = True
+                rollout_logits_list.append((i, pos, current_logits))
 
-                for rel_pos in decode_relative:
-                    pos = start_i + rel_pos.item()
-                    current_logits = logits[i, pos, :]  # [vocab] — WITH grad
-
-                    # Sample DETACHED
-                    with torch.no_grad():
-                        _, token_id = _sample_tokens(
-                            current_logits.detach().unsqueeze(0),
-                            temperature, top_p,
-                        )
-                        token_id = token_id.squeeze()
-
-                    assignments.append(_DecodeAssignment(
-                        batch_idx=i, position=pos, token_id=token_id
-                    ))
-                    decoded_positions[i, pos] = True
-                    rollout_logits_list.append((i, pos, current_logits))
-
-            # Apply all assignments safely (no in-place)
             student_decoded = _apply_assignments(student_decoded, assignments)
             student_decoded_sub = student_decoded[:, :max_needed]
 

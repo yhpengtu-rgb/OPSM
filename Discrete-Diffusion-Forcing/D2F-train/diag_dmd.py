@@ -54,13 +54,7 @@ def main():
     training_mode = config.get("training_mode", "dream")
     is_llada = (training_mode == "llada")
     shift = (not is_llada) and config.train.enable_shift
-    base = denoiser.get_base_model() if hasattr(denoiser, "get_base_model") else denoiser
-    try:
-        vsize = base.config.vocab_size
-    except Exception:
-        vsize = 128000
-
-    student_decoded, decoded_positions, rollout_logits = student_blockwise_rollout_dmd(
+    student_decoded, decoded_positions, transitions = student_blockwise_rollout_dmd(
         input_ids=input_ids,
         student_model=denoiser,
         question_length=question_length,
@@ -71,22 +65,16 @@ def main():
         temperature=config.train.temperature,
         top_p=config.train.top_p,
         device=input_ids.device,
-        vocab_size=vsize,
         is_llada=is_llada,
         shift=shift,
-        use_grad_checkpoint=config.train.get('dmd_grad_checkpoint', True),
     )
     print("\n=== ROLLOUT DIAGNOSTICS ===")
     print(f"decoded_positions.sum(): {decoded_positions.sum().item()}")
-    print(f"rollout_logits.requires_grad: {rollout_logits.requires_grad}")
-    print(f"rollout_logits.grad_fn: {rollout_logits.grad_fn}")
-    print(f"rollout_logits dtype: {rollout_logits.dtype}")
-    if decoded_positions.any():
-        rl = rollout_logits[decoded_positions]
-        print(f"rollout_logits[decoded] shape: {rl.shape}, absmax: {rl.abs().max().item():.4f}, mean: {rl.mean().item():.4f}")
-        print(f"rollout_logits[decoded] all zero? {(rl == 0).all().item()}")
+    print(f"successor transitions: {len(transitions)}")
+    if transitions:
+        print(f"first successor remaining masks: {transitions[0]['remaining_mask'].sum().item()}")
     else:
-        print("!! decoded_positions EMPTY after rollout")
+        print("!! no successor transition contains remaining masks")
 
     # valid_mask filtering (same as loss fn)
     L = input_ids.shape[1]

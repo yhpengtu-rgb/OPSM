@@ -38,7 +38,8 @@ train:
   distillation_mode: "on-policy"
   dmd_loss: true               # enable DMD-style loss
   dmd_ema_decay: 0.999         # EMA fake model decay rate
-  dmd_grad_checkpoint: false  # disabled to avoid in-place op conflict
+  dmd_grad_checkpoint: false  # rollout is detached; successor DMD uses fresh forwards
+  aux_remaining_weight: 0.0   # optional ground-truth masked-token auxiliary loss
   student_decode_steps: 1
   teacher_rollout_steps: 1
   # Teacher uses disable_adapter() (base model) + full bidirectional attention

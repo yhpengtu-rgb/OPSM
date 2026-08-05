@@ -342,22 +342,14 @@ def compute_dmd_loss(
     config=None,
     lengths=None,
 ):
-    """DMD-style on-policy loss.
+    """Three-model Concrete transition-DMD on successor rollout states.
 
-    Loss = -sg(c) · log p_student(token)
-
-    where c = log p_teacher(token) - log p_fake(token) is the density-ratio
-    score (stop-gradient).  For decoded positions, ``log p_student`` comes
-    from the Gumbel-softmax rollout logits (y1); for remaining masked
-    positions, it comes from a fresh student forward pass on the
-    fully-decoded sequence.
-
-    Args:
-        ema_lora: EMALoRA instance for fake-model forward (density ratio).
-        All other args same as ``compute_on_policy_loss``.
-
-    Returns:
-        Dictionary with 'loss' and diagnostic metrics.
+    Student rollout transitions are detached. After every unmask transition
+    x_t -> x_{t+1}, this loss evaluates the current block's remaining masks
+    in x_{t+1}: the student receives the Concrete Score Matching surrogate,
+    while the EMA fake and frozen teacher define its detached DMD vector
+    field. A small ground-truth masked-token term remains an explicit,
+    configurable auxiliary objective.
     """
     from utils.on_policy_rollout import student_blockwise_rollout_dmd
 
@@ -368,18 +360,10 @@ def compute_dmd_loss(
     is_llada = (training_mode == 'llada')
     shift = (not is_llada) and enable_shift
 
-    try:
-        base = denoiser.get_base_model() if hasattr(denoiser, 'get_base_model') else denoiser
-        rollout_vocab_size = base.config.vocab_size
-    except Exception:
-        rollout_vocab_size = 128000
+    # Step 1: Detached rollout. Each record is a successor state x_{t+1}
+    # together with remaining masks in the block that just made a transition.
 
-    # Step 1: Rollout with grad (logits y1 kept for DMD loss, sampling detached)
-    # No Gumbel-softmax needed — DMD gradient flows through y1 (logits),
-    # not through the sampled token y1' (which is just a stop-gradient index).
-    dmd_grad_ckpt = config.train.get('dmd_grad_checkpoint', True) if config is not None else True
-
-    student_decoded, decoded_positions, rollout_logits = student_blockwise_rollout_dmd(
+    student_decoded, decoded_positions, transitions = student_blockwise_rollout_dmd(
         input_ids=input_ids,
         student_model=denoiser,
         question_length=question_length,
@@ -390,128 +374,118 @@ def compute_dmd_loss(
         temperature=temperature,
         top_p=top_p,
         device=device,
-        vocab_size=rollout_vocab_size,
         is_llada=is_llada,
         shift=shift,
-        use_grad_checkpoint=dmd_grad_ckpt,
     )
 
-    # Step 2: Build attention masks.
-    # Following the original D2F codebase, the teacher uses:
-    #   * disable_adapter() — the pre-trained base model (no LoRA), which is
-    #     the more accurate, frozen target distribution.
-    #   * Full bidirectional attention — torch.zeros([1,1,L,L]), so every
-    #     token attends to every other token.  This matches the original
-    #     ref_logits path in compute_llada_loss / compute_loss.
-    # The fake model (EMA of student) and fresh student both use the
-    # STUDENT block-size (block-causal mask), representing the student's
-    # own block-wise causal attention pattern.
-    attention_mask_student = build_custom_float_attention_mask(
-        student_decoded, question_length, block_size, device=device
-    ).to(torch.float16)
-    # Full bidirectional mask (all zeros) — matches original D2F teacher.
-    attention_mask_teacher = torch.zeros(
-        [1, 1, L, L], dtype=torch.float16, device=device
-    )
-
-    student_kwargs = (
-        {"attention_bias": attention_mask_student} if is_llada
-        else {"attention_mask": attention_mask_student}
-    )
-    teacher_kwargs = (
-        {"attention_bias": attention_mask_teacher} if is_llada
-        else {"attention_mask": attention_mask_teacher}
-    )
-
-    # Step 3: Teacher forward — base model (disable_adapter), full bidirectional.
-    # no_grad: the teacher is the frozen target distribution.
-    with torch.no_grad():
-        with denoiser.disable_adapter():
-            logits_teacher = denoiser(student_decoded, **teacher_kwargs).logits
-            if shift:
-                logits_teacher = shift_logits(logits_teacher)
-
-    # Step 4: Fake forward — EMA LoRA, student block-size.
-    with torch.no_grad():
-        with ema_lora.swap(denoiser):
-            logits_fake = denoiser(student_decoded, **student_kwargs).logits
-            if shift:
-                logits_fake = shift_logits(logits_fake)
-
-    # Step 5: Fresh student forward for remaining positions (WITH grad)
-    logits_student_fresh = denoiser(student_decoded, **student_kwargs).logits
-    if shift:
-        logits_student_fresh = shift_logits(logits_student_fresh)
-
-    # Step 6: Build valid-position mask (exclude pure padding)
+    # Step 2: Compute Concrete transition-DMD on every successor state.
+    # Teacher is full-bidirectional; fake and student use block-causal masks.
     if lengths is not None:
         token_positions = torch.arange(L, device=device).unsqueeze(0)
         valid_mask = token_positions < lengths.to(device).unsqueeze(1)
-        decoded_positions = decoded_positions & valid_mask
     else:
-        valid_mask = None
+        valid_mask = torch.ones((B, L), dtype=torch.bool, device=device)
 
-    # Step 7: DMD loss on decoded positions (using rollout logits y1)
-    if decoded_positions.any():
-        sampled_tokens = student_decoded[decoded_positions]  # y1'
+    transition_losses = []
+    for transition in transitions:
+        successor_ids = transition["input_ids"]
+        successor_mask = transition["remaining_mask"] & valid_mask
+        if not successor_mask.any():
+            continue
 
-        # log p_student from rollout logits (Gumbel-softmax grad chain)
-        log_p_student = F.log_softmax(rollout_logits[decoded_positions], dim=-1)
-        log_p_student = log_p_student.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+        attention_mask_student = build_custom_float_attention_mask(
+            successor_ids, question_length, block_size, device=device
+        ).to(torch.float16)
+        attention_mask_teacher = torch.zeros(
+            [1, 1, L, L], dtype=torch.float16, device=device
+        )
+        student_kwargs = (
+            {"attention_bias": attention_mask_student} if is_llada
+            else {"attention_mask": attention_mask_student}
+        )
+        teacher_kwargs = (
+            {"attention_bias": attention_mask_teacher} if is_llada
+            else {"attention_mask": attention_mask_teacher}
+        )
 
-        # Score c = log p_teacher - log p_fake (NO grad)
         with torch.no_grad():
-            log_p_teacher = F.log_softmax(logits_teacher[decoded_positions], dim=-1)
-            log_p_teacher = log_p_teacher.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
-            log_p_fake = F.log_softmax(logits_fake[decoded_positions], dim=-1)
-            log_p_fake = log_p_fake.gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
-            c = log_p_teacher - log_p_fake  # density ratio
+            with denoiser.disable_adapter():
+                teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
+                if shift:
+                    teacher_logits = shift_logits(teacher_logits)
+            with ema_lora.swap(denoiser):
+                fake_logits = denoiser(successor_ids, **student_kwargs).logits
+                if shift:
+                    fake_logits = shift_logits(fake_logits)
 
-        loss_decoded = -(c.detach() * log_p_student).mean()
+        student_logits = denoiser(successor_ids, **student_kwargs).logits
+        if shift:
+            student_logits = shift_logits(student_logits)
+
+        student_logits = student_logits[successor_mask]
+        teacher_logits = teacher_logits[successor_mask]
+        fake_logits = fake_logits[successor_mask]
+
+        # Concrete score matching: student probabilities provide the measure;
+        # EMA fake minus teacher defines the detached DMD score vector field.
+        student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
+        fake_logits = fake_logits.float()
+        teacher_logits = teacher_logits.float()
+        fake_mean = (student_probs * fake_logits).sum(dim=-1, keepdim=True)
+        teacher_mean = (student_probs * teacher_logits).sum(dim=-1, keepdim=True)
+        fake_score = fake_logits - fake_mean
+        teacher_score = teacher_logits - teacher_mean
+        grad_coeff = 2.0 * student_probs * (fake_score - teacher_score)
+        transition_losses.append(
+            (grad_coeff.detach() * student_logits.float()).sum(dim=-1).mean()
+        )
+
+    if transition_losses:
+        loss_transition = torch.stack(transition_losses).mean()
     else:
-        loss_decoded = torch.tensor(0.0, device=device, requires_grad=True)
+        # A final one-token block has no successor mask and therefore no CSM
+        # term. Keep a zero-valued path to trainable parameters so DeepSpeed
+        # still observes a valid backward pass for that batch.
+        loss_transition = sum(
+            (parameter.reshape(-1)[0] * 0.0)
+            for parameter in denoiser.parameters()
+            if parameter.requires_grad
+        )
 
-    # Step 8: DMD loss on remaining masked positions (using fresh forward)
-    remaining_mask = (student_decoded == mask_id) & (~decoded_positions)
-    if valid_mask is not None:
-        remaining_mask = remaining_mask & valid_mask
+    # Step 3: Optional ground-truth masked-token auxiliary objective on the
+    # final rollout state. It is not part of the transition-DMD objective.
+    aux_remaining_weight = config.train.get('aux_remaining_weight', 0.0) if config is not None else 0.0
+    remaining_mask = (student_decoded == mask_id) & valid_mask
+    loss_remaining = torch.zeros((), device=device)
+    if aux_remaining_weight and remaining_mask.any():
+        attention_mask_student = build_custom_float_attention_mask(
+            student_decoded, question_length, block_size, device=device
+        ).to(torch.float16)
+        student_kwargs = (
+            {"attention_bias": attention_mask_student} if is_llada
+            else {"attention_mask": attention_mask_student}
+        )
+        logits_aux = denoiser(student_decoded, **student_kwargs).logits
+        if shift:
+            logits_aux = shift_logits(logits_aux)
+        loss_remaining = F.cross_entropy(logits_aux[remaining_mask], input_ids[remaining_mask])
 
-    if remaining_mask.any():
-        gt_tokens = input_ids[remaining_mask]  # ground-truth tokens
-
-        # log p_student from fresh forward (WITH grad)
-        log_p_student_rem = F.log_softmax(logits_student_fresh[remaining_mask], dim=-1)
-        log_p_student_rem = log_p_student_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
-
-        # Score c for remaining positions (NO grad)
-        with torch.no_grad():
-            log_p_teacher_rem = F.log_softmax(logits_teacher[remaining_mask], dim=-1)
-            log_p_teacher_rem = log_p_teacher_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
-            log_p_fake_rem = F.log_softmax(logits_fake[remaining_mask], dim=-1)
-            log_p_fake_rem = log_p_fake_rem.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1)
-            c_rem = log_p_teacher_rem - log_p_fake_rem
-
-        loss_remaining = -(c_rem.detach() * log_p_student_rem).mean()
-    else:
-        loss_remaining = torch.tensor(0.0, device=device, requires_grad=True)
-
-    loss = loss_decoded + loss_remaining
-
-    # Safety: always connect the loss to model parameters via the fresh student
-    # forward (Step 5, always runs WITH grad).  When both decoded_positions and
-    # remaining_mask are empty (e.g. a batch whose question alone fills
-    # max_length), loss_decoded / loss_remaining are leaf tensors with no
-    # grad_fn, so accelerator.backward() is a no-op and the GradScaler's
-    # unscale_ never records an inf check — triggering "No inf checks were
-    # recorded for this optimizer" at optimizer.step().  The 0.0 multiplier
-    # adds a zero-valued grad path through logits_student_fresh without
-    # changing the loss value.
-    loss = loss + 0.0 * logits_student_fresh[0, 0, 0]
-
+    loss = loss_transition + aux_remaining_weight * loss_remaining
+    # DMD successor masks vary across batches. Keep every trainable adapter
+    # parameter in the autograd graph with a zero contribution so DeepSpeed's
+    # partitioned gradient reducer sees a stable parameter set each step.
+    loss = loss + sum(
+        (parameter.reshape(-1)[0] * 0.0)
+        for parameter in denoiser.parameters()
+        if parameter.requires_grad
+    )
     losses = {
         'loss': loss,
+        'transition_dmd_loss': loss_transition.detach(),
+        'aux_remaining_loss': loss_remaining.detach(),
         'student_decoded_length': decoded_positions.sum().float() / B,
         'remaining_mask_length': remaining_mask.sum().float() / B,
+        'transition_count': torch.tensor(len(transition_losses), device=device),
     }
 
     return losses

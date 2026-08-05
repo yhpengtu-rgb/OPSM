@@ -371,29 +371,23 @@ def student_blockwise_rollout_dmd(
     temperature: float = 1.0,
     top_p: float = 0.95,
     device: Optional[torch.device] = None,
-    vocab_size: int = 128000,
     is_llada: bool = False,
     shift: bool = True,
-    use_grad_checkpoint: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """DMD rollout: forward WITH grad, sampling DETACHED.
+) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
+    """Produce detached top-1 rollout transitions for successor-state DMD.
 
-    The DMD loss is ``-sg(c) · log_softmax(y1)[y1']`` where y1 is the
-    rollout logits (with grad) and y1' is the sampled token ID (just an
-    index, stop-gradient).  The gradient flows through y1 directly —
-    NOT through the sampling operation.
-
-    Each block performs ``num_decode_steps`` differentiable forwards. Each
-    forward selects and decodes one sampled-token-confidence top-1 position.
-
-    Uses non-in-place tensor updates via _apply_assignments to prevent
-    autograd issues with gradient checkpointing.
+    Each block runs ``num_decode_steps`` rollout forwards, each selecting and
+    unmasking one high-confidence token. After every transition x_t -> x_t+1,
+    this function records x_t+1 and the remaining masked positions in the
+    current block. ``compute_dmd_loss`` evaluates student, teacher and EMA
+    fake distributions on those successor states using Concrete Score
+    Matching; no rollout activation graph is retained here.
 
     Returns:
-        student_decoded: [B, L] decoded token IDs (hard, detached).
-        decoded_positions: [B, L] bool mask of decoded positions.
-        rollout_logits: [B, L, vocab_size] logits at decoded positions
-            (WITH grad).  Zero at non-decoded positions.
+        student_decoded: final hard rollout sequence.
+        decoded_positions: positions unmasked by the rollout.
+        transitions: detached successor-state records with ``input_ids`` and
+            ``remaining_mask`` tensors of shape [B, L].
     """
     B, L = input_ids.shape
     if device is None:
@@ -412,7 +406,7 @@ def student_blockwise_rollout_dmd(
     total_blocks = [(npl + block_size - 1) // block_size for npl in non_prompt_lens]
     max_blocks = max(total_blocks) if total_blocks else 0
 
-    rollout_logits_list: List[Tuple[int, int, torch.Tensor]] = []
+    transitions: List[Dict[str, torch.Tensor]] = []
 
     attention_mask_full = build_custom_float_attention_mask(
         student_decoded, question_length, block_size, device=device
@@ -453,54 +447,45 @@ def student_blockwise_rollout_dmd(
             if not active_with_masks:
                 break
 
-            # Keep a standalone checkpoint input because student_decoded is
-            # replaced after this forward, before checkpoint recomputation.
-            fwd_input = student_decoded_sub.clone()
-            if use_grad_checkpoint:
-                outputs = torch.utils.checkpoint.checkpoint(
-                    _fwd, fwd_input, attention_mask_sub,
-                    use_reentrant=False,
-                )
-            else:
-                outputs = _fwd(fwd_input, attention_mask_sub)
+            # The rollout only determines the student trajectory. Its graph is
+            # intentionally detached; gradients are computed on x_{t+1} below.
+            with torch.no_grad():
+                logits = _fwd(student_decoded_sub, attention_mask_sub).logits
+                if shift:
+                    logits = shift_logits(logits)
 
-            logits = outputs.logits
-            if shift:
-                logits = shift_logits(logits)
-
-            assignments: List[_DecodeAssignment] = []
-            for i in active_with_masks:
-                start_i, end_i = block_ranges[i]
-                mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
-                with torch.no_grad():
+                assignments: List[_DecodeAssignment] = []
+                for i in active_with_masks:
+                    start_i, end_i = block_ranges[i]
+                    mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
                     decode_relative = _select_top1_position(
-                        logits[i, start_i:end_i].detach(), mask_in_block,
+                        logits[i, start_i:end_i], mask_in_block,
                         temperature=temperature, top_p=top_p,
                     )
-                pos = start_i + decode_relative.item()
-                current_logits = logits[i, pos, :]
-                with torch.no_grad():
+                    pos = start_i + decode_relative.item()
                     _, token_id = _sample_tokens(
-                        current_logits.detach().unsqueeze(0), temperature, top_p,
+                        logits[i, pos, :].unsqueeze(0), temperature, top_p,
                     )
-                assignments.append(_DecodeAssignment(
-                    batch_idx=i, position=pos, token_id=token_id.squeeze()
-                ))
-                decoded_positions[i, pos] = True
-                rollout_logits_list.append((i, pos, current_logits))
+                    assignments.append(_DecodeAssignment(
+                        batch_idx=i, position=pos, token_id=token_id.squeeze()
+                    ))
+                    decoded_positions[i, pos] = True
 
-            student_decoded = _apply_assignments(student_decoded, assignments)
-            student_decoded_sub = student_decoded[:, :max_needed]
+                student_decoded = _apply_assignments(student_decoded, assignments)
+                student_decoded_sub = student_decoded[:, :max_needed]
 
-    # --- Assemble rollout_logits [B, L, vocab] efficiently -----------------
-    if rollout_logits_list:
-        model_dtype = rollout_logits_list[0][2].dtype
-        rollout_logits = _assemble_rollout_logits(
-            rollout_logits_list, B, L, vocab_size, device, model_dtype,
-        )
-    else:
-        rollout_logits = torch.zeros(
-            B, L, vocab_size, device=device
-        )
+                # x_{t+1}: only remaining masks in the just-transitioned block
+                # receive this transition's three-model Concrete DMD update.
+                remaining_mask = torch.zeros_like(decoded_positions)
+                for i in active_with_masks:
+                    start_i, end_i = block_ranges[i]
+                    remaining_mask[i, start_i:end_i] = (
+                        student_decoded[i, start_i:end_i] == mask_id
+                    )
+                if remaining_mask.any():
+                    transitions.append({
+                        "input_ids": student_decoded.clone(),
+                        "remaining_mask": remaining_mask,
+                    })
 
-    return student_decoded, decoded_positions, rollout_logits
+    return student_decoded, decoded_positions, transitions

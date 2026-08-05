@@ -21,21 +21,20 @@ specific block positions (not just appended). Each block's tokens are
 decoded independently within the block, but subsequent blocks attend to
 all prior tokens. A full forward pass per block iteration is required.
 
-Block-internal decoding (matching original D2F generation.py)
+Block-internal decoding (strictly aligned with eval_llada.py)
 --------------------------------------------------------------
-Within each block, positions are NOT decoded in fixed order.  Instead:
+Within each block, positions are decoded by sampled-token confidence:
 
     for step in range(ceil(block_size / k)):
         1. Forward pass → logits for ALL masked positions in the block
-        2. Compute confidence = sum(p * log p)  (negative entropy)
-        3. Select top-k positions by confidence  (k = num_decode_steps)
+        2. _sample_tokens → confidence = probability of sampled token
+           (NO margin_confidence / NO neg_entropy)
+        3. Select top-k positions by confidence  (k = num_decode_steps = step)
         4. Sample and decode those k positions
         5. Repeat until block has no more masked positions
 
-This mirrors the ``generate_block()`` inference path where
-``number_transfer_tokens = 1`` (k=1) and positions are selected by
-``torch.topk(confidence, 1)`` — the most confident position is decoded
-first, providing context for subsequent positions.
+This mirrors ``_generate_block_single`` in ``D2F-eval/eval_llada.py`` and
+``sample_tokens`` in ``model_cache/dream/generation_utils.py``.
 """
 
 import torch
@@ -61,41 +60,100 @@ def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
-def _top_p_sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-    probs = F.softmax(logits / temperature, dim=-1)
-    if top_p >= 1.0:
-        return torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(probs.shape[:-1])
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+def top_p_logits(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Nucleus (top-p) filtering, matching eval_llada.py."""
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
     sorted_indices_to_remove = cumulative_probs > top_p
+    # Shift right to keep the first token above the threshold
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = False
-    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-    probs = probs.masked_fill(indices_to_remove, 0.0)
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-    return torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(probs.shape[:-1])
+    sorted_indices_to_remove[..., 0] = 0
+
+    mask = torch.zeros_like(logits, dtype=torch.bool, device=logits.device)
+    mask = mask.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+    logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
+    return logits
+
+
+def _sample_tokens(
+    logits: torch.Tensor,
+    temperature: float = 0.0,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample tokens and return (confidence, token_id), aligned with eval_llada.
+
+    This mirrors ``model_cache/dream/generation_utils.py::sample_tokens``
+    but WITHOUT the ``margin_confidence`` / ``neg_entropy`` branches: the
+    returned confidence is simply the probability of the sampled token
+    (``initial_confidence``). This is the exact on-policy alignment the
+    train rollout requires.
+
+    Args:
+        logits: [..., vocab] logits.
+        temperature: sampling temperature (0 = greedy argmax).
+        top_p: nucleus filtering probability (None/>=1 disable).
+        top_k: top-k logits filtering (None disables).
+
+    Returns:
+        confidence: [..., vocab]->[...,] probability of the sampled token.
+        x0: [...,] sampled token ids.
+    """
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = top_p_logits(logits, top_p)
+    if top_k is not None:
+        top_k = min(top_k, logits.size(-1))
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits = logits.masked_fill(indices_to_remove, torch.finfo(logits.dtype).min)
+
+    probs = F.softmax(logits, dim=-1)
+
+    if temperature > 0:
+        try:
+            x0 = torch.distributions.Categorical(probs=probs).sample()
+            confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
+        except Exception:
+            confidence, x0 = probs.max(dim=-1)
+    else:
+        confidence, x0 = probs.max(dim=-1)
+
+    return confidence, x0
 
 
 def _select_topk_positions(
     logits: torch.Tensor,
     mask_in_block: torch.Tensor,
     num_decode_steps: int,
+    temperature: float = 0.0,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
 ) -> torch.Tensor:
-    """Select top-k masked positions by confidence (negative entropy).
+    """Select top-k masked positions by sampled-token confidence.
+
+    Aligned with eval_llada: confidence is the probability of the sampled
+    token (no margin_confidence / neg_entropy), then positions are sorted
+    by confidence and the top-k are decoded, where k = step
+    (num_decode_steps).
 
     Args:
         logits: [sub_L, vocab] logits for the block's subsequence.
         mask_in_block: [sub_L] bool, True at masked positions within the block.
-        num_decode_steps: k, number of positions to select.
+        num_decode_steps: k, number of positions to select (the step).
+        temperature: sampling temperature.
+        top_p: nucleus filtering probability.
+        top_k: top-k logits filtering.
 
     Returns:
-        decode_absolute_positions: [k] absolute (within-sub-L) positions to decode.
+        decode_relative_positions: [k] positions (within the block's
+            subsequence) to decode, sorted by confidence descending.
     """
     block_logits = logits[mask_in_block]  # [num_masked, vocab]
 
-    probs = F.softmax(block_logits, dim=-1)
-    log_probs = torch.log(probs + 1e-10)
-    confidence = (probs * log_probs).sum(dim=-1)  # [num_masked], higher = more confident
+    confidence, _ = _sample_tokens(
+        block_logits, temperature=temperature, top_p=top_p, top_k=top_k
+    )  # [num_masked]
 
     k = min(num_decode_steps, int(mask_in_block.sum().item()))
     _, topk_relative_idx = torch.topk(confidence, k)
@@ -275,13 +333,14 @@ def student_blockwise_rollout(
                 with torch.no_grad():
                     decode_relative = _select_topk_positions(
                         logits[i, start_i:end_i], mask_in_block, num_decode_steps,
+                        temperature=temperature, top_p=top_p,
                     )
 
                 for rel_pos in decode_relative:
                     pos = start_i + rel_pos.item()
                     current_logits = logits[i, pos, :].unsqueeze(0)
-                    sampled = _top_p_sample(current_logits, temperature, top_p)
-                    token = sampled.squeeze()
+                    _, token = _sample_tokens(current_logits, temperature, top_p)
+                    token = token.squeeze()
                     assignments.append(_DecodeAssignment(
                         batch_idx=i, position=pos, token_id=token
                     ))
@@ -464,6 +523,7 @@ def student_blockwise_rollout_dmd(
                         logits[i, start_i:end_i].detach(),
                         mask_in_block,
                         num_decode_steps,
+                        temperature=temperature, top_p=top_p,
                     )
 
                 for rel_pos in decode_relative:
@@ -472,11 +532,11 @@ def student_blockwise_rollout_dmd(
 
                     # Sample DETACHED
                     with torch.no_grad():
-                        sampled = _top_p_sample(
+                        _, token_id = _sample_tokens(
                             current_logits.detach().unsqueeze(0),
                             temperature, top_p,
                         )
-                        token_id = sampled.squeeze()
+                        token_id = token_id.squeeze()
 
                     assignments.append(_DecodeAssignment(
                         batch_idx=i, position=pos, token_id=token_id

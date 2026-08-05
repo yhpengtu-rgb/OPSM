@@ -575,19 +575,37 @@ def compute_transition_csm_loss(
             transition_loss = (grad_coeff * student_logits.float()).sum(dim=-1).mean()
         else:
             transition_loss = student_logits_full[0, 0, 0] * 0.0
-        remaining_mask = (predecessor_ids == mask_id) & transition['answer_mask']
-        loss_remaining = torch.zeros((), device=device)
-        if aux_remaining_weight and remaining_mask.any():
-            loss_remaining = F.cross_entropy(
-                student_logits_full[remaining_mask], input_ids[remaining_mask]
-            )
-
         transition_total = transition_total + transition_loss.detach() / transition_count
-        aux_remaining_total = aux_remaining_total + loss_remaining.detach() / transition_count
-        remaining_mask_total = remaining_mask_total + remaining_mask.sum().float() / transition_count
-        loss = (transition_loss + aux_remaining_weight * loss_remaining) / transition_count
-        backward_callback(loss + zero_term())
+        backward_callback(transition_loss / transition_count + zero_term())
 
+    # CE anchors the endpoint of the latest sampled transition, independently
+    # of the CSM gradients computed for every sampled transition above.
+    final_transition = transitions[-1]
+    final_successor_ids = final_transition['successor_ids']
+    final_remaining_mask = (
+        (final_successor_ids == mask_id)
+        & final_transition['answer_mask']
+        & valid_mask
+    )
+    loss_remaining = torch.zeros((), device=device)
+    if aux_remaining_weight and final_remaining_mask.any():
+        final_student_mask = build_custom_float_attention_mask(
+            final_successor_ids, prompt_lengths, block_size, device=device
+        ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+        final_student_kwargs = (
+            {'attention_bias': final_student_mask} if is_llada
+            else {'attention_mask': final_student_mask}
+        )
+        final_student_logits = denoiser(final_successor_ids, **final_student_kwargs).logits
+        if shift:
+            final_student_logits = shift_logits(final_student_logits)
+        loss_remaining = F.cross_entropy(
+            final_student_logits[final_remaining_mask], input_ids[final_remaining_mask]
+        )
+        backward_callback(aux_remaining_weight * loss_remaining + zero_term())
+
+    aux_remaining_total = loss_remaining.detach()
+    remaining_mask_total = final_remaining_mask.sum().float()
     total_loss = transition_total + aux_remaining_weight * aux_remaining_total
     return {
         'loss': total_loss,

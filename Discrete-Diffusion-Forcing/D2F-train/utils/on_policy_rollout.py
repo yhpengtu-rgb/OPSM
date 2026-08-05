@@ -374,20 +374,19 @@ def student_blockwise_rollout_dmd(
     is_llada: bool = False,
     shift: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
-    """Produce detached top-1 rollout transitions for successor-state DMD.
+    """Produce a detached final rollout state for successor-state DMD.
 
-    Each block runs ``num_decode_steps`` rollout forwards, each selecting and
-    unmasking one high-confidence token. After every transition x_t -> x_t+1,
-    this function records x_t+1 and the remaining masked positions in the
-    current block. ``compute_dmd_loss`` evaluates student, teacher and EMA
-    fake distributions on those successor states using Concrete Score
-    Matching; no rollout activation graph is retained here.
+    Every block completes ``num_decode_steps`` top-1 unmask operations before
+    the sole transition record is created. Therefore ``transitions[-1]`` is
+    the state after the entire blockwise rollout, not an intermediate block or
+    decode-step state. ``compute_dmd_loss`` evaluates student, teacher and EMA
+    fake exactly once on its remaining masks using Concrete Score Matching.
 
     Returns:
         student_decoded: final hard rollout sequence.
         decoded_positions: positions unmasked by the rollout.
-        transitions: detached successor-state records with ``input_ids`` and
-            ``remaining_mask`` tensors of shape [B, L].
+        transitions: a one-element list containing the final detached state
+            and its all-block remaining-mask tensor of shape [B, L].
     """
     B, L = input_ids.shape
     if device is None:
@@ -474,18 +473,11 @@ def student_blockwise_rollout_dmd(
                 student_decoded = _apply_assignments(student_decoded, assignments)
                 student_decoded_sub = student_decoded[:, :max_needed]
 
-                # x_{t+1}: only remaining masks in the just-transitioned block
-                # receive this transition's three-model Concrete DMD update.
-                remaining_mask = torch.zeros_like(decoded_positions)
-                for i in active_with_masks:
-                    start_i, end_i = block_ranges[i]
-                    remaining_mask[i, start_i:end_i] = (
-                        student_decoded[i, start_i:end_i] == mask_id
-                    )
-                if remaining_mask.any():
-                    transitions.append({
-                        "input_ids": student_decoded.clone(),
-                        "remaining_mask": remaining_mask,
-                    })
-
+    # One final successor state after all blocks have executed their configured
+    # number of rollout steps. The mask spans every block, not only the last.
+    remaining_mask = student_decoded == mask_id
+    transitions = [{
+        "input_ids": student_decoded.clone(),
+        "remaining_mask": remaining_mask,
+    }]
     return student_decoded, decoded_positions, transitions

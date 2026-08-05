@@ -360,8 +360,8 @@ def compute_dmd_loss(
     is_llada = (training_mode == 'llada')
     shift = (not is_llada) and enable_shift
 
-    # Step 1: Detached rollout. Each record is a successor state x_{t+1}
-    # together with remaining masks in the block that just made a transition.
+    # Step 1: Detached rollout. transitions[-1] is the sole final state after
+    # every block has completed its configured student_decode_steps updates.
 
     student_decoded, decoded_positions, transitions = student_blockwise_rollout_dmd(
         input_ids=input_ids,
@@ -378,7 +378,7 @@ def compute_dmd_loss(
         shift=shift,
     )
 
-    # Step 2: Compute Concrete transition-DMD on every successor state.
+    # Step 2: Compute Concrete DMD once on the final rollout state.
     # Teacher is full-bidirectional; fake and student use block-causal masks.
     if lengths is not None:
         token_positions = torch.arange(L, device=device).unsqueeze(0)
@@ -386,89 +386,68 @@ def compute_dmd_loss(
     else:
         valid_mask = torch.ones((B, L), dtype=torch.bool, device=device)
 
-    transition_losses = []
-    for transition in transitions:
-        successor_ids = transition["input_ids"]
-        successor_mask = transition["remaining_mask"] & valid_mask
-        if not successor_mask.any():
-            continue
+    final_transition = transitions[-1]
+    successor_ids = final_transition["input_ids"]
+    successor_mask = final_transition["remaining_mask"] & valid_mask
 
-        attention_mask_student = build_custom_float_attention_mask(
-            successor_ids, question_length, block_size, device=device
-        ).to(torch.float16)
-        attention_mask_teacher = torch.zeros(
-            [1, 1, L, L], dtype=torch.float16, device=device
-        )
-        student_kwargs = (
-            {"attention_bias": attention_mask_student} if is_llada
-            else {"attention_mask": attention_mask_student}
-        )
-        teacher_kwargs = (
-            {"attention_bias": attention_mask_teacher} if is_llada
-            else {"attention_mask": attention_mask_teacher}
-        )
+    attention_mask_student = build_custom_float_attention_mask(
+        successor_ids, question_length, block_size, device=device
+    ).to(torch.float16)
+    attention_mask_teacher = torch.zeros(
+        [1, 1, L, L], dtype=torch.float16, device=device
+    )
+    student_kwargs = (
+        {"attention_bias": attention_mask_student} if is_llada
+        else {"attention_mask": attention_mask_student}
+    )
+    teacher_kwargs = (
+        {"attention_bias": attention_mask_teacher} if is_llada
+        else {"attention_mask": attention_mask_teacher}
+    )
 
-        with torch.no_grad():
-            with denoiser.disable_adapter():
-                teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
-                if shift:
-                    teacher_logits = shift_logits(teacher_logits)
-            with ema_lora.swap(denoiser):
-                fake_logits = denoiser(successor_ids, **student_kwargs).logits
-                if shift:
-                    fake_logits = shift_logits(fake_logits)
+    with torch.no_grad():
+        with denoiser.disable_adapter():
+            teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
+            if shift:
+                teacher_logits = shift_logits(teacher_logits)
+        with ema_lora.swap(denoiser):
+            fake_logits = denoiser(successor_ids, **student_kwargs).logits
+            if shift:
+                fake_logits = shift_logits(fake_logits)
 
-        student_logits = denoiser(successor_ids, **student_kwargs).logits
-        if shift:
-            student_logits = shift_logits(student_logits)
+    student_logits_full = denoiser(successor_ids, **student_kwargs).logits
+    if shift:
+        student_logits_full = shift_logits(student_logits_full)
 
-        student_logits = student_logits[successor_mask]
-        teacher_logits = teacher_logits[successor_mask]
-        fake_logits = fake_logits[successor_mask]
+    if successor_mask.any():
+        student_logits = student_logits_full[successor_mask]
+        teacher_logits = teacher_logits[successor_mask].float()
+        fake_logits = fake_logits[successor_mask].float()
 
         # Concrete score matching: student probabilities provide the measure;
         # EMA fake minus teacher defines the detached DMD score vector field.
         student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
-        fake_logits = fake_logits.float()
-        teacher_logits = teacher_logits.float()
         fake_mean = (student_probs * fake_logits).sum(dim=-1, keepdim=True)
         teacher_mean = (student_probs * teacher_logits).sum(dim=-1, keepdim=True)
         fake_score = fake_logits - fake_mean
         teacher_score = teacher_logits - teacher_mean
         grad_coeff = 2.0 * student_probs * (fake_score - teacher_score)
-        transition_losses.append(
-            (grad_coeff.detach() * student_logits.float()).sum(dim=-1).mean()
-        )
-
-    if transition_losses:
-        loss_transition = torch.stack(transition_losses).mean()
+        loss_transition = (
+            grad_coeff.detach() * student_logits.float()
+        ).sum(dim=-1).mean()
     else:
-        # A final one-token block has no successor mask and therefore no CSM
-        # term. Keep a zero-valued path to trainable parameters so DeepSpeed
-        # still observes a valid backward pass for that batch.
-        loss_transition = sum(
-            (parameter.reshape(-1)[0] * 0.0)
-            for parameter in denoiser.parameters()
-            if parameter.requires_grad
-        )
+        loss_transition = student_logits_full[0, 0, 0] * 0.0
 
     # Step 3: Optional ground-truth masked-token auxiliary objective on the
     # final rollout state. It is not part of the transition-DMD objective.
     aux_remaining_weight = config.train.get('aux_remaining_weight', 0.0) if config is not None else 0.0
-    remaining_mask = (student_decoded == mask_id) & valid_mask
+    remaining_mask = successor_mask
     loss_remaining = torch.zeros((), device=device)
     if aux_remaining_weight and remaining_mask.any():
-        attention_mask_student = build_custom_float_attention_mask(
-            student_decoded, question_length, block_size, device=device
-        ).to(torch.float16)
-        student_kwargs = (
-            {"attention_bias": attention_mask_student} if is_llada
-            else {"attention_mask": attention_mask_student}
+        # Reuse the final-state student forward already computed for CSM.
+        loss_remaining = F.cross_entropy(
+            student_logits_full[remaining_mask], input_ids[remaining_mask]
         )
-        logits_aux = denoiser(student_decoded, **student_kwargs).logits
-        if shift:
-            logits_aux = shift_logits(logits_aux)
-        loss_remaining = F.cross_entropy(logits_aux[remaining_mask], input_ids[remaining_mask])
 
     loss = loss_transition + aux_remaining_weight * loss_remaining
     # DMD successor masks vary across batches. Keep every trainable adapter
@@ -485,7 +464,7 @@ def compute_dmd_loss(
         'aux_remaining_loss': loss_remaining.detach(),
         'student_decoded_length': decoded_positions.sum().float() / B,
         'remaining_mask_length': remaining_mask.sum().float() / B,
-        'transition_count': torch.tensor(len(transition_losses), device=device),
+        'transition_count': torch.tensor(1, device=device),
     }
 
     return losses

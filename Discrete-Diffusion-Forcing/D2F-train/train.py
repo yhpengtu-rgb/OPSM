@@ -95,18 +95,22 @@ def main(args):
     num_iters_cap = config.train.get('num_iters', None)
     num_epochs = config.train.get('num_epochs', None)
 
-    # Progress bar: prefer num_iters cap if set, else num_epochs * len(dataloader)
+    # ``global_step`` counts optimizer updates, while ``len(dataloader)``
+    # counts micro-batches.  Keep the progress bar in optimizer-step units so
+    # gradient accumulation does not overstate training progress.
+    accumulation_steps = config.train.gradient_accumulation_steps
+    updates_per_epoch = (len(dataloader) + accumulation_steps - 1) // accumulation_steps
     if num_iters_cap is not None:
         total_steps = num_iters_cap
     elif num_epochs is not None:
-        total_steps = num_epochs * len(dataloader)
+        total_steps = global_step + num_epochs * updates_per_epoch
     else:
         total_steps = None
 
     progress_bar = tqdm(
         total   = total_steps,
         initial = global_step,
-        desc    = 'Steps',
+        desc    = 'Optimizer steps',
         disable = not accelerator.is_local_main_process,
     )
 

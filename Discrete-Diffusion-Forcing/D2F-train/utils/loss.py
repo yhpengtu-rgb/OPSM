@@ -2,6 +2,12 @@ import torch
 from utils.util import forward_process_length, shift_logits, forward_process, build_custom_float_attention_mask
 import torch.nn.functional as F
 
+
+def _unwrap_model(model):
+    while hasattr(model, 'module'):
+        model = model.module
+    return model
+
 def compute_loss(
         input_ids,
         denoiser,
@@ -483,7 +489,7 @@ def compute_dmd_loss(
 def compute_transition_csm_loss(
     input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
     enable_shift, eos_id, student_decode_steps=1, temperature=1.0, top_p=0.95,
-    config=None, lengths=None, backward_callback=None,
+    config=None, lengths=None, backward_callback=None, gradient_probe_callback=None,
 ):
     """Run CSM on one uniformly sampled hard rollout transition."""
     from utils.on_policy_rollout import student_blockwise_rollout_dmd
@@ -527,6 +533,7 @@ def compute_transition_csm_loss(
     aux_remaining_total = torch.zeros((), device=device)
     remaining_mask_total = torch.zeros((), device=device)
     aux_remaining_weight = config.train.get('aux_remaining_weight', 0.0)
+    adapter_model = _unwrap_model(denoiser)
     teacher_mask = torch.zeros([B, 1, L, L], dtype=torch.float16, device=device).masked_fill(
         ~valid_mask[:, None, None, :], float('-inf')
     )
@@ -550,7 +557,7 @@ def compute_transition_csm_loss(
         student_kwargs = {'attention_bias': predecessor_mask} if is_llada else {'attention_mask': predecessor_mask}
         fake_kwargs = {'attention_bias': successor_mask} if is_llada else {'attention_mask': successor_mask}
         with torch.no_grad():
-            with denoiser.disable_adapter():
+            with adapter_model.disable_adapter():
                 teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
                 if shift:
                     teacher_logits = shift_logits(teacher_logits)
@@ -577,6 +584,17 @@ def compute_transition_csm_loss(
 
     for _ in range(synced_transition_count - transition_count):
         backward_callback(zero_term())
+
+    csm_grads = None
+    if gradient_probe_callback is not None:
+        csm_grads = {
+            parameter: parameter.grad.detach().clone()
+            for parameter in denoiser.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        }
+        for parameter in denoiser.parameters():
+            if parameter.requires_grad:
+                parameter.grad = None
 
     # CE anchors the endpoint of the latest sampled transition, independently
     # of the CSM gradients computed for every sampled transition above. Every
@@ -607,6 +625,31 @@ def compute_transition_csm_loss(
                 final_student_logits[final_remaining_mask], input_ids[final_remaining_mask]
             )
     backward_callback(aux_remaining_weight * loss_remaining + zero_term())
+    if gradient_probe_callback is not None:
+        ce_grads = {
+            parameter: parameter.grad.detach().clone()
+            for parameter in denoiser.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        }
+        ce_grad_sq = torch.zeros((), device=device)
+        for grad in ce_grads.values():
+            ce_grad_sq = ce_grad_sq + grad.float().square().sum()
+        ce_norm = torch.nan_to_num(
+            ce_grad_sq.sqrt() / max(abs(aux_remaining_weight), 1e-8),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        csm_norm = torch.zeros((), device=device)
+        if csm_grads is not None:
+            for grad in csm_grads.values():
+                csm_norm = csm_norm + grad.float().square().sum()
+            csm_norm = csm_norm.sqrt()
+        csm_norm = torch.nan_to_num(csm_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        gradient_probe_callback(csm_norm, ce_norm)
+        for parameter in denoiser.parameters():
+            if parameter.requires_grad:
+                parameter.grad = csm_grads.get(parameter, torch.zeros_like(parameter))
+                if parameter in ce_grads:
+                    parameter.grad.add_(ce_grads[parameter])
 
     aux_remaining_total = loss_remaining.detach()
     remaining_mask_total = final_remaining_mask.sum().float()
@@ -736,6 +779,7 @@ def compute_loss_by_config(
         lengths=None,
         ema_lora=None,
         backward_callback=None,
+        gradient_probe_callback=None,
 ):
     """Select different loss functions based on config file"""
     training_mode = config.get('training_mode', 'dream')
@@ -767,6 +811,7 @@ def compute_loss_by_config(
                 enable_shift, eos_id, student_decode_steps=student_decode_steps,
                 temperature=temperature, top_p=top_p, config=config, lengths=lengths,
                 backward_callback=backward_callback,
+                gradient_probe_callback=gradient_probe_callback,
             )
 
         if final_draft_remask:

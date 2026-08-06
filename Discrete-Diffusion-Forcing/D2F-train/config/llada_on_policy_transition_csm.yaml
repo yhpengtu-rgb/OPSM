@@ -34,6 +34,14 @@ train:
   dmd_loss: false
   dmd_ema_decay: 0.999
   aux_remaining_weight: 0.1
+  # Optional low-frequency EMA gradient-norm balancing for auxiliary CE.
+  adaptive_weighting: false
+  adaptive_weight_probe_every: 100
+  adaptive_weight_ema_decay: 0.9
+  adaptive_weight_target_ce_ratio: 0.3
+  adaptive_weight_update_rate: 0.1
+  adaptive_weight_min: 0.01
+  adaptive_weight_max: 10.0
   student_decode_steps: 1
   teacher_rollout_steps: 1
   temperature: 0.8

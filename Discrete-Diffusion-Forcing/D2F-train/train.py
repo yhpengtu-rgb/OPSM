@@ -172,13 +172,19 @@ def main(args):
             )
         accelerator.wait_for_everyone()
 
+    adaptive_aux_weight = config.train.get('aux_remaining_weight', 0.0)
+    adaptive_csm_ema = None
+    adaptive_ce_ema = None
+    adaptive_last_csm_norm = torch.zeros((), device=accelerator.device)
+    adaptive_last_ce_norm = torch.zeros((), device=accelerator.device)
+
     # --- Per-step training closure ---------------------------------------
     # Extracted so the async-pipeline loop can train on the *previously*
     # fetched batch (whose rollout result is in hand) while the *next* batch
     # is rolling out on the rollout GPU.  ``rollout_results`` is None for the
     # synchronous path (loss fn runs the rollout inline).
     def train_one_step(batch, rollout_results):
-        nonlocal global_step, training_done
+        nonlocal global_step, training_done, adaptive_aux_weight, adaptive_csm_ema, adaptive_ce_ema, adaptive_last_csm_norm, adaptive_last_ce_norm
         with accelerator.accumulate([denoiser]):
             denoiser.train()
             input_ids = batch['data']
@@ -192,6 +198,32 @@ def main(args):
             # Use unified loss function selection. When the async pipeline
             # supplies ``rollout_results``, the loss fn skips its internal
             # rollout and consumes these directly.
+            probe_every = config.train.get('adaptive_weight_probe_every', 0)
+            adaptive_enabled = config.train.get('adaptive_weighting', False)
+            probe = None
+            if transition_csm and adaptive_enabled and probe_every and global_step % probe_every == 0:
+                def probe(csm_norm, ce_norm):
+                    nonlocal adaptive_csm_ema, adaptive_ce_ema, adaptive_last_csm_norm, adaptive_last_ce_norm, adaptive_aux_weight
+                    adaptive_last_csm_norm = accelerator.gather(csm_norm.detach()).mean()
+                    adaptive_last_ce_norm = accelerator.gather(ce_norm.detach()).mean()
+                    if not (torch.isfinite(adaptive_last_csm_norm) and torch.isfinite(adaptive_last_ce_norm)):
+                        return
+                    if adaptive_csm_ema is None:
+                        adaptive_csm_ema = adaptive_last_csm_norm
+                        adaptive_ce_ema = adaptive_last_ce_norm
+                    else:
+                        ema_decay = config.train.get('adaptive_weight_ema_decay', 0.9)
+                        adaptive_csm_ema = ema_decay * adaptive_csm_ema + (1 - ema_decay) * adaptive_last_csm_norm
+                        adaptive_ce_ema = ema_decay * adaptive_ce_ema + (1 - ema_decay) * adaptive_last_ce_norm
+                    target_ratio = config.train.get('adaptive_weight_target_ce_ratio', 0.3)
+                    update_rate = config.train.get('adaptive_weight_update_rate', 0.1)
+                    target = target_ratio * adaptive_csm_ema / adaptive_ce_ema.clamp_min(1e-8)
+                    target = torch.nan_to_num(target, nan=adaptive_aux_weight, posinf=config.train.get('adaptive_weight_max', 10.0), neginf=config.train.get('adaptive_weight_min', 0.01))
+                    adaptive_aux_weight = float((adaptive_aux_weight * (target / max(adaptive_aux_weight, 1e-8)).pow(update_rate)).clamp(
+                        config.train.get('adaptive_weight_min', 0.01), config.train.get('adaptive_weight_max', 10.0)
+                    ).item())
+            if adaptive_enabled:
+                config.train.aux_remaining_weight = adaptive_aux_weight
             losses = compute_loss_by_config(
                 input_ids,
                 denoiser,
@@ -209,6 +241,7 @@ def main(args):
                 lengths       = lengths,
                 ema_lora      = ema_lora,
                 backward_callback = accelerator.backward if (transition_csm or final_draft_remask) else None,
+                gradient_probe_callback = probe,
             )
 
             if config.train.share_steps > 1:
@@ -250,6 +283,11 @@ def main(args):
                 'total_loss': gather_loss('loss'),
                 'dmd_loss': gather_loss('transition_dmd_loss'),
                 'ce_loss': gather_loss('aux_remaining_loss'),
+                'adaptive_aux_weight': adaptive_aux_weight,
+                'csm_grad_norm': adaptive_last_csm_norm.item(),
+                'ce_grad_norm': adaptive_last_ce_norm.item(),
+                'adaptive_csm_ema': adaptive_csm_ema.item() if adaptive_csm_ema is not None else 0.0,
+                'adaptive_ce_ema': adaptive_ce_ema.item() if adaptive_ce_ema is not None else 0.0,
             }
             accelerator.log(logs, step=global_step)
             progress_bar.set_postfix(**logs)

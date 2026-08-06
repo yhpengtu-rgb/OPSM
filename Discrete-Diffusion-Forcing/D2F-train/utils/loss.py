@@ -509,22 +509,19 @@ def compute_transition_csm_loss(
         question_length.to(device=device, dtype=torch.long).clamp(0, L), valid_lengths
     )
     valid_mask = torch.arange(L, device=device).unsqueeze(0) < valid_lengths.unsqueeze(1)
-    if not transitions:
-        zero_loss = sum(
-            parameter.reshape(-1)[0] * 0.0 for parameter in denoiser.parameters()
-            if parameter.requires_grad
+    local_transition_count = len(transitions)
+    synced_transition_count = local_transition_count
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        main_transition_count = torch.tensor(
+            [local_transition_count], dtype=torch.long, device=device
         )
-        backward_callback(zero_loss)
-        return {
-            'loss': zero_loss.detach(),
-            'transition_dmd_loss': zero_loss.detach(),
-            'aux_remaining_loss': zero_loss.detach(),
-            'student_decoded_length': decoded_positions.sum().float() / B,
-            'remaining_mask_length': torch.zeros((), device=device),
-            'transition_count': torch.tensor(0, device=device),
-            'backward_done': True,
-        }
+        torch.distributed.broadcast(main_transition_count, src=0)
+        synced_transition_count = main_transition_count.item()
 
+    # Rank 0 caps real CSM transitions. Ranks with fewer local transitions pad
+    # the missing backwards with zero gradients so every rank performs the same
+    # number of DDP/DeepSpeed gradient-reduction collectives.
+    transitions = transitions[:synced_transition_count]
     transition_count = len(transitions)
     transition_total = torch.zeros((), device=device)
     aux_remaining_total = torch.zeros((), device=device)
@@ -575,34 +572,41 @@ def compute_transition_csm_loss(
             transition_loss = (grad_coeff * student_logits.float()).sum(dim=-1).mean()
         else:
             transition_loss = student_logits_full[0, 0, 0] * 0.0
-        transition_total = transition_total + transition_loss.detach() / transition_count
-        backward_callback(transition_loss / transition_count + zero_term())
+        transition_total = transition_total + transition_loss.detach() / synced_transition_count
+        backward_callback(transition_loss / synced_transition_count + zero_term())
+
+    for _ in range(synced_transition_count - transition_count):
+        backward_callback(zero_term())
 
     # CE anchors the endpoint of the latest sampled transition, independently
-    # of the CSM gradients computed for every sampled transition above.
-    final_transition = transitions[-1]
-    final_successor_ids = final_transition['successor_ids']
-    final_remaining_mask = (
-        (final_successor_ids == mask_id)
-        & final_transition['answer_mask']
-        & valid_mask
-    )
+    # of the CSM gradients computed for every sampled transition above. Every
+    # rank invokes its CE backward once, including ranks without a local
+    # endpoint, to keep distributed gradient collectives aligned.
+    final_remaining_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
     loss_remaining = torch.zeros((), device=device)
-    if aux_remaining_weight and final_remaining_mask.any():
-        final_student_mask = build_custom_float_attention_mask(
-            final_successor_ids, prompt_lengths, block_size, device=device
-        ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
-        final_student_kwargs = (
-            {'attention_bias': final_student_mask} if is_llada
-            else {'attention_mask': final_student_mask}
+    if transition_count:
+        final_transition = transitions[-1]
+        final_successor_ids = final_transition['successor_ids']
+        final_remaining_mask = (
+            (final_successor_ids == mask_id)
+            & final_transition['answer_mask']
+            & valid_mask
         )
-        final_student_logits = denoiser(final_successor_ids, **final_student_kwargs).logits
-        if shift:
-            final_student_logits = shift_logits(final_student_logits)
-        loss_remaining = F.cross_entropy(
-            final_student_logits[final_remaining_mask], input_ids[final_remaining_mask]
-        )
-        backward_callback(aux_remaining_weight * loss_remaining + zero_term())
+        if aux_remaining_weight and final_remaining_mask.any():
+            final_student_mask = build_custom_float_attention_mask(
+                final_successor_ids, prompt_lengths, block_size, device=device
+            ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+            final_student_kwargs = (
+                {'attention_bias': final_student_mask} if is_llada
+                else {'attention_mask': final_student_mask}
+            )
+            final_student_logits = denoiser(final_successor_ids, **final_student_kwargs).logits
+            if shift:
+                final_student_logits = shift_logits(final_student_logits)
+            loss_remaining = F.cross_entropy(
+                final_student_logits[final_remaining_mask], input_ids[final_remaining_mask]
+            )
+    backward_callback(aux_remaining_weight * loss_remaining + zero_term())
 
     aux_remaining_total = loss_remaining.detach()
     remaining_mask_total = final_remaining_mask.sum().float()

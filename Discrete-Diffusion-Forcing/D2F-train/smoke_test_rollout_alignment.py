@@ -173,8 +173,9 @@ def test_transition_csm_loss(device):
         backward_callback=backward,
     )
     assert losses["transition_count"].item() == 2
-    expected_backward_calls = 2 + int(losses["remaining_mask_length"].item() > 0)
-    assert len(backward_calls) == expected_backward_calls
+    # Transition-CSM always performs one final CE/zero-gradient backward so
+    # distributed ranks execute an identical collective sequence.
+    assert len(backward_calls) == 3
     assert any(parameter.grad is not None for parameter in model.parameters())
     print(f"  {len(backward_calls)} backward call(s), two sampled block transitions  ✅")
     print("  PASSED\n")

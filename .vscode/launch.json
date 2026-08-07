@@ -8,13 +8,13 @@
             "module": "accelerate.commands.launch",
             "args": [
                 "--config_file", "config/acc_config",
-                "--num_processes", "1",
+                "--num_processes", "2",
                 "--main_process_port", "29579",
                 "train.py",
-                "--config", "config/llada_on_policy_dmd.yaml"
+                "--config", "config/llada_on_policy_transition_csm.yaml"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0"
+                "CUDA_VISIBLE_DEVICES": "0,1"
             },
             "cwd": "/inspire/ssd/project/sais-bio/public/tupeng/OPSM/Discrete-Diffusion-Forcing/D2F-train",
             "console": "integratedTerminal",

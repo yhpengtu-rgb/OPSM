@@ -390,10 +390,11 @@ def student_blockwise_rollout_dmd(
     """Produce a detached rollout and sampled block transitions for CSM.
 
     ``transition_sample_ratio`` selects a uniform subset of rollout blocks.
-    ``decode_mode='parallel_block'`` fills all remaining positions in each
-    block from one shared forward pass; ``sequential`` preserves the legacy
-    confidence-ordered rollout. At least one block is retained whenever the
-    rollout has any block.
+    ``parallel_block`` fills all remaining positions from one forward, while
+    ``confidence_topk`` spreads the block across ``num_decode_steps`` forwards
+    by filling the highest-confidence remaining positions each time.
+    ``sequential`` preserves the legacy top-1 rollout. At least one block is
+    retained whenever the rollout has any block.
     """
     B, L = input_ids.shape
     if device is None:
@@ -473,13 +474,14 @@ def student_blockwise_rollout_dmd(
         if selected_block:
             predecessor_ids = student_decoded.detach().clone()
 
-        if decode_mode not in {'sequential', 'parallel_block'}:
+        if decode_mode not in {'sequential', 'parallel_block', 'confidence_topk'}:
             raise ValueError(f"Unsupported rollout decode mode: {decode_mode}")
         decode_iterations = 1 if decode_mode == 'parallel_block' else num_decode_steps
 
-        # Each sequential decode step fills the highest-confidence position;
-        # parallel_block fills every remaining position from one forward.
-        for _ in range(decode_iterations):
+        # sequential fills top-1, parallel_block fills all remaining positions,
+        # and confidence_topk dynamically shares remaining tokens across the
+        # rollout forwards still available for the current block.
+        for decode_step in range(decode_iterations):
             active_with_masks = [
                 i for i in active
                 if (student_decoded_sub[i, block_ranges[i][0]:block_ranges[i][1]] == mask_id).any()
@@ -498,17 +500,28 @@ def student_blockwise_rollout_dmd(
                 for i in active_with_masks:
                     start_i, end_i = block_ranges[i]
                     mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
+                    masked_relative = torch.nonzero(mask_in_block, as_tuple=True)[0]
                     if decode_mode == 'parallel_block':
-                        decode_relative = torch.nonzero(mask_in_block, as_tuple=True)[0]
-                    else:
-                        decode_relative = _select_top1_position(
-                            logits[i, start_i:end_i], mask_in_block,
-                            temperature=temperature, top_p=top_p,
+                        decode_relative = masked_relative
+                        confidence, token_ids = _sample_tokens(
+                            logits[i, start_i + decode_relative, :], temperature, top_p,
                         )
+                    else:
+                        candidate_confidence, candidate_tokens = _sample_tokens(
+                            logits[i, start_i + masked_relative, :], temperature, top_p,
+                        )
+                        if decode_mode == 'confidence_topk':
+                            remaining_steps = decode_iterations - decode_step
+                            token_count = (masked_relative.numel() + remaining_steps - 1) // remaining_steps
+                            selected = torch.topk(candidate_confidence, token_count).indices
+                        else:
+                            selected = torch.nonzero(
+                                candidate_confidence == candidate_confidence.max(), as_tuple=True
+                            )[0]
+                        decode_relative = masked_relative[selected]
+                        confidence = candidate_confidence[selected]
+                        token_ids = candidate_tokens[selected]
                     positions = start_i + decode_relative
-                    confidence, token_ids = _sample_tokens(
-                        logits[i, positions, :], temperature, top_p,
-                    )
                     for pos, token_id, token_confidence in zip(
                         positions.tolist(), token_ids, confidence
                     ):

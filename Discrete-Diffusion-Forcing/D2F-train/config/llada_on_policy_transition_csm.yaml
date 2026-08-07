@@ -46,9 +46,9 @@ train:
   adaptive_weight_update_rate: 0.1
   adaptive_weight_min: 0.01
   adaptive_weight_max: 10.0
-  # Decode every remaining position in a block from one rollout forward.
-  macro_rollout_decode_mode: parallel_block
-  student_decode_steps: 16
+  # Spread each block over this many confidence-top-k rollout forwards.
+  macro_rollout_decode_mode: confidence_topk
+  student_decode_steps: 4
   teacher_rollout_steps: 1
   temperature: 0.0
   top_p: 1.0

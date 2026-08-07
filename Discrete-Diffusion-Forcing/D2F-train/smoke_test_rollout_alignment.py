@@ -212,6 +212,39 @@ def test_final_draft_remask_loss(device):
     print("  PASSED\n")
 
 
+def test_confidence_topk_rollout(device):
+    print(f"=== test_confidence_topk_rollout ({device}) ===")
+    torch.manual_seed(17)
+    vocab, d_model, L, mask_id = 32, 8, 16, 0
+    model = TinyLLada(vocab, d_model, L).to(device).eval()
+    with torch.no_grad():
+        model.proj.bias[mask_id] = -100.0
+    input_ids = torch.zeros(1, L, dtype=torch.long, device=device)
+    input_ids[0, :2] = torch.tensor([1, 2], device=device)
+    decoded, _, _, confidence = student_blockwise_rollout_dmd(
+        input_ids=input_ids,
+        student_model=model,
+        question_length=torch.tensor([2], device=device),
+        block_size=6,
+        num_decode_steps=4,
+        mask_id=mask_id,
+        eos_id=mask_id,
+        temperature=0.0,
+        top_p=1.0,
+        device=device,
+        is_llada=False,
+        shift=True,
+        lengths=torch.tensor([14], device=device),
+        return_rollout_confidence=True,
+        decode_mode='confidence_topk',
+    )
+    answer_mask = torch.arange(L, device=device).unsqueeze(0).ge(2) & torch.arange(L, device=device).unsqueeze(0).lt(14)
+    assert decoded[answer_mask].ne(mask_id).all()
+    assert torch.isfinite(confidence[answer_mask]).all()
+    print("  confidence-top-k fills every block within configured forwards  ✅")
+    print("  PASSED\n")
+
+
 def test_transition_csm_rollout(device):
     print(f"=== test_transition_csm_rollout ({device}) ===")
     torch.manual_seed(7)
@@ -276,12 +309,14 @@ if __name__ == "__main__":
     test_sample_tokens()
     test_select_top1_position()
     test_full_rollout(torch.device("cpu"))
+    test_confidence_topk_rollout(torch.device("cpu"))
     test_transition_csm_rollout(torch.device("cpu"))
     test_transition_csm_loss(torch.device("cpu"))
     test_final_draft_remask_loss(torch.device("cpu"))
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
         test_full_rollout(device)
+        test_confidence_topk_rollout(device)
         test_transition_csm_rollout(device)
         test_transition_csm_loss(device)
         test_final_draft_remask_loss(device)

@@ -112,7 +112,6 @@ def main(args):
         initial = global_step,
         desc    = 'Optimizer steps',
         disable = not accelerator.is_local_main_process,
-        sort_dict_keys = False,
     )
 
     if accelerator.is_main_process:
@@ -296,7 +295,7 @@ def main(args):
                 'adaptive_ce_ema': adaptive_ce_ema.item() if adaptive_ce_ema is not None else 0.0,
             }
             accelerator.log(logs, step=global_step)
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix(ordered_dict=logs, refresh=True)
 
         if global_step > 0 and global_step % config.train.eval_every == 0 and accelerator.is_main_process:
             denoiser.eval();

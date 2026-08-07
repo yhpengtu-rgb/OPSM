@@ -32,8 +32,8 @@ train:
   transition_csm: false
   macro_remask_csm: true
   macro_remask_ratio: 0.25
-  # full_draft uses the student draft as x_s; teacher_corrected is optional.
-  macro_remask_successor: full_draft
+  # Teacher refines the remasked predecessor to construct x_s.
+  macro_remask_successor: teacher_corrected
   macro_remask_gt_ce_weight: 0.1
   dmd_loss: false
   dmd_ema_decay: 0.999

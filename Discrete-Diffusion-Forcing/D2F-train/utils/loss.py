@@ -691,6 +691,7 @@ def compute_macro_remask_csm_loss(
         eos_id=eos_id, temperature=temperature, top_p=top_p, device=device,
         is_llada=is_llada, shift=shift, lengths=lengths,
         return_rollout_confidence=True,
+        decode_mode=config.train.get('macro_rollout_decode_mode', 'sequential'),
     )
     if lengths is None:
         valid_lengths = torch.full((B,), L, device=device, dtype=torch.long)

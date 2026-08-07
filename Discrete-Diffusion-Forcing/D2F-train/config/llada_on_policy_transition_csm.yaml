@@ -46,7 +46,8 @@ train:
   adaptive_weight_update_rate: 0.1
   adaptive_weight_min: 0.01
   adaptive_weight_max: 10.0
-  # Decode each block fully before constructing the macro transition.
+  # Decode every remaining position in a block from one rollout forward.
+  macro_rollout_decode_mode: parallel_block
   student_decode_steps: 16
   teacher_rollout_steps: 1
   temperature: 0.0

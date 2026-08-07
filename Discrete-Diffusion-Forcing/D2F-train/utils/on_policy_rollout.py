@@ -385,11 +385,15 @@ def student_blockwise_rollout_dmd(
     transition_csm: bool = False,
     transition_sample_ratio: float = 0.0,
     return_rollout_confidence: bool = False,
+    decode_mode: str = 'sequential',
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
     """Produce a detached rollout and sampled block transitions for CSM.
 
     ``transition_sample_ratio`` selects a uniform subset of rollout blocks.
-    At least one block is retained whenever the rollout has any block.
+    ``decode_mode='parallel_block'`` fills all remaining positions in each
+    block from one shared forward pass; ``sequential`` preserves the legacy
+    confidence-ordered rollout. At least one block is retained whenever the
+    rollout has any block.
     """
     B, L = input_ids.shape
     if device is None:
@@ -469,8 +473,13 @@ def student_blockwise_rollout_dmd(
         if selected_block:
             predecessor_ids = student_decoded.detach().clone()
 
-        # Each decode step runs one rollout forward and fills one top-1 position.
-        for _ in range(num_decode_steps):
+        if decode_mode not in {'sequential', 'parallel_block'}:
+            raise ValueError(f"Unsupported rollout decode mode: {decode_mode}")
+        decode_iterations = 1 if decode_mode == 'parallel_block' else num_decode_steps
+
+        # Each sequential decode step fills the highest-confidence position;
+        # parallel_block fills every remaining position from one forward.
+        for _ in range(decode_iterations):
             active_with_masks = [
                 i for i in active
                 if (student_decoded_sub[i, block_ranges[i][0]:block_ranges[i][1]] == mask_id).any()
@@ -489,10 +498,13 @@ def student_blockwise_rollout_dmd(
                 for i in active_with_masks:
                     start_i, end_i = block_ranges[i]
                     mask_in_block = student_decoded_sub[i, start_i:end_i] == mask_id
-                    decode_relative = _select_top1_position(
-                        logits[i, start_i:end_i], mask_in_block,
-                        temperature=temperature, top_p=top_p,
-                    )
+                    if decode_mode == 'parallel_block':
+                        decode_relative = torch.nonzero(mask_in_block, as_tuple=True)[0]
+                    else:
+                        decode_relative = _select_top1_position(
+                            logits[i, start_i:end_i], mask_in_block,
+                            temperature=temperature, top_p=top_p,
+                        )
                     positions = start_i + decode_relative
                     confidence, token_ids = _sample_tokens(
                         logits[i, positions, :], temperature, top_p,

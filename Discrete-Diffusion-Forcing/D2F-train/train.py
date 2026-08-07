@@ -112,6 +112,7 @@ def main(args):
         initial = global_step,
         desc    = 'Optimizer steps',
         disable = not accelerator.is_local_main_process,
+        sort_dict_keys = False,
     )
 
     if accelerator.is_main_process:

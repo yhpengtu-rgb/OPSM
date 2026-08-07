@@ -131,18 +131,19 @@ def _select_top1_position(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
 ) -> torch.Tensor:
-    """Select one masked position by sampled-token confidence.
+    """Select all masked positions tied for maximum sampled-token confidence.
 
-    ``student_decode_steps`` controls how many times this function is used
-    within a block; it is not a top-k width. Each rollout forward therefore
-    decodes only the highest-confidence masked position, matching eval_llada.
+    A rollout forward normally decodes one position. Exact confidence ties are
+    decoded together so their tokens share the same pre-update block context.
+    ``student_decode_steps`` remains the maximum number of rollout forwards
+    for a block, not a top-k width.
     """
     block_logits = logits[mask_in_block]  # [num_masked, vocab]
     confidence, _ = _sample_tokens(
         block_logits, temperature=temperature, top_p=top_p, top_k=top_k
     )
     masked_relative_positions = torch.nonzero(mask_in_block, as_tuple=True)[0]
-    return masked_relative_positions[torch.argmax(confidence)].reshape(1)
+    return masked_relative_positions[confidence == confidence.max()]
 
 
 def _apply_assignments(
@@ -311,15 +312,16 @@ def student_blockwise_rollout(
                     logits[i, start_i:end_i], mask_in_block,
                     temperature=temperature, top_p=top_p,
                 )
-                pos = start_i + decode_relative.item()
-                confidence, token = _sample_tokens(logits[i, pos, :].unsqueeze(0), temperature, top_p)
-                assignments.append(_DecodeAssignment(
-                    batch_idx=i,
-                    position=pos,
-                    token_id=token.squeeze(),
-                    confidence=confidence.squeeze(),
-                ))
-                decoded_positions[i, pos] = True
+                positions = start_i + decode_relative
+                confidence, tokens = _sample_tokens(logits[i, positions, :], temperature, top_p)
+                for pos, token, token_confidence in zip(positions.tolist(), tokens, confidence):
+                    assignments.append(_DecodeAssignment(
+                        batch_idx=i,
+                        position=pos,
+                        token_id=token,
+                        confidence=token_confidence,
+                    ))
+                    decoded_positions[i, pos] = True
 
             student_decoded = _apply_assignments(student_decoded, assignments)
             student_decoded_sub = student_decoded[:, :max_needed]
@@ -491,17 +493,20 @@ def student_blockwise_rollout_dmd(
                         logits[i, start_i:end_i], mask_in_block,
                         temperature=temperature, top_p=top_p,
                     )
-                    pos = start_i + decode_relative.item()
-                    confidence, token_id = _sample_tokens(
-                        logits[i, pos, :].unsqueeze(0), temperature, top_p,
+                    positions = start_i + decode_relative
+                    confidence, token_ids = _sample_tokens(
+                        logits[i, positions, :], temperature, top_p,
                     )
-                    assignments.append(_DecodeAssignment(
-                        batch_idx=i,
-                        position=pos,
-                        token_id=token_id.squeeze(),
-                        confidence=confidence.squeeze(),
-                    ))
-                    decoded_positions[i, pos] = True
+                    for pos, token_id, token_confidence in zip(
+                        positions.tolist(), token_ids, confidence
+                    ):
+                        assignments.append(_DecodeAssignment(
+                            batch_idx=i,
+                            position=pos,
+                            token_id=token_id,
+                            confidence=token_confidence,
+                        ))
+                        decoded_positions[i, pos] = True
 
                 student_decoded = _apply_assignments(student_decoded, assignments)
                 if assignments:

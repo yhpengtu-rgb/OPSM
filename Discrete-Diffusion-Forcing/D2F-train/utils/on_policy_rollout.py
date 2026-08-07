@@ -49,6 +49,7 @@ class _DecodeAssignment(NamedTuple):
     batch_idx: int
     position: int
     token_id: torch.Tensor
+    confidence: torch.Tensor
 
 
 def _attn_kwargs(is_llada: bool, block_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -148,9 +149,9 @@ def _apply_assignments(
     decoded: torch.Tensor,
     assignments: List[_DecodeAssignment],
 ) -> torch.Tensor:
-    """Apply all assignments to a tensor WITHOUT in-place operations.
+    """Apply all assignments to a tensor without in-place operations.
 
-    Uses index_put_ which creates a new tensor, avoiding autograd issues
+    Uses the out-of-place ``index_put`` operation to avoid autograd issues
     with gradient checkpointing.
 
     Args:
@@ -163,13 +164,15 @@ def _apply_assignments(
     if not assignments:
         return decoded
 
-    batch_indices = torch.tensor([a.batch_idx for a in assignments],
-                                device=decoded.device, dtype=torch.long)
-    position_indices = torch.tensor([a.position for a in assignments],
-                                    device=decoded.device, dtype=torch.long)
-    token_values = torch.stack([a.token_id for a in assignments])
+    batch_indices = torch.tensor(
+        [a.batch_idx for a in assignments], device=decoded.device, dtype=torch.long
+    )
+    position_indices = torch.tensor(
+        [a.position for a in assignments], device=decoded.device, dtype=torch.long
+    )
+    token_values = torch.stack([a.token_id for a in assignments]).to(decoded.device)
 
-    return decoded.index_put_((batch_indices, position_indices), token_values)
+    return decoded.index_put((batch_indices, position_indices), token_values)
 
 
 def _assemble_rollout_logits(
@@ -309,9 +312,12 @@ def student_blockwise_rollout(
                     temperature=temperature, top_p=top_p,
                 )
                 pos = start_i + decode_relative.item()
-                _, token = _sample_tokens(logits[i, pos, :].unsqueeze(0), temperature, top_p)
+                confidence, token = _sample_tokens(logits[i, pos, :].unsqueeze(0), temperature, top_p)
                 assignments.append(_DecodeAssignment(
-                    batch_idx=i, position=pos, token_id=token.squeeze()
+                    batch_idx=i,
+                    position=pos,
+                    token_id=token.squeeze(),
+                    confidence=confidence.squeeze(),
                 ))
                 decoded_positions[i, pos] = True
 
@@ -376,6 +382,7 @@ def student_blockwise_rollout_dmd(
     lengths: Optional[torch.Tensor] = None,
     transition_csm: bool = False,
     transition_sample_ratio: float = 0.0,
+    return_rollout_confidence: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, torch.Tensor]]]:
     """Produce a detached rollout and sampled block transitions for CSM.
 
@@ -399,6 +406,9 @@ def student_blockwise_rollout_dmd(
     prompt_mask = token_positions < prompt_lengths.unsqueeze(1)
     student_decoded[~prompt_mask] = mask_id
     decoded_positions = torch.zeros_like(input_ids, dtype=torch.bool)
+    rollout_confidence = torch.full(
+        input_ids.shape, float('inf'), dtype=torch.float32, device=device
+    )
 
     prompt_lens = [int(prompt_lengths[i].item()) for i in range(B)]
     non_prompt_lens = [int(valid_lengths[i].item()) - pl for i, pl in enumerate(prompt_lens)]
@@ -482,15 +492,35 @@ def student_blockwise_rollout_dmd(
                         temperature=temperature, top_p=top_p,
                     )
                     pos = start_i + decode_relative.item()
-                    _, token_id = _sample_tokens(
+                    confidence, token_id = _sample_tokens(
                         logits[i, pos, :].unsqueeze(0), temperature, top_p,
                     )
                     assignments.append(_DecodeAssignment(
-                        batch_idx=i, position=pos, token_id=token_id.squeeze()
+                        batch_idx=i,
+                        position=pos,
+                        token_id=token_id.squeeze(),
+                        confidence=confidence.squeeze(),
                     ))
                     decoded_positions[i, pos] = True
 
                 student_decoded = _apply_assignments(student_decoded, assignments)
+                if assignments:
+                    batch_indices = torch.tensor(
+                        [assignment.batch_idx for assignment in assignments],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    position_indices = torch.tensor(
+                        [assignment.position for assignment in assignments],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    confidence_values = torch.stack(
+                        [assignment.confidence for assignment in assignments]
+                    ).float()
+                    rollout_confidence = rollout_confidence.index_put(
+                        (batch_indices, position_indices), confidence_values
+                    )
                 student_decoded_sub = student_decoded[:, :max_needed]
 
         if selected_block:
@@ -511,4 +541,6 @@ def student_blockwise_rollout_dmd(
             "input_ids": student_decoded.clone(),
             "remaining_mask": remaining_mask,
         }]
+    if return_rollout_confidence:
+        return student_decoded, decoded_positions, transitions, rollout_confidence
     return student_decoded, decoded_positions, transitions

@@ -156,12 +156,13 @@ def main(args):
     dmd_loss = getattr(config.train, 'dmd_loss', False)
     transition_csm = getattr(config.train, 'transition_csm', False)
     final_draft_remask = getattr(config.train, 'final_draft_remask', False)
-    if dmd_loss or transition_csm:
+    macro_remask_csm = getattr(config.train, 'macro_remask_csm', False)
+    if dmd_loss or transition_csm or macro_remask_csm:
         if async_pipeline is not None:
             raise ValueError("dmd_loss/transition_csm and async_rollout_device are mutually exclusive.")
     if final_draft_remask and async_pipeline is not None:
         raise ValueError("final_draft_remask and async_rollout_device are mutually exclusive.")
-    if dmd_loss or transition_csm:
+    if dmd_loss or transition_csm or macro_remask_csm:
         from utils.ema_lora import EMALoRA
         ema_decay = getattr(config.train, 'dmd_ema_decay', 0.999)
         ema_lora = EMALoRA(denoiser, decay=ema_decay)
@@ -203,7 +204,7 @@ def main(args):
             # supplies ``rollout_results``, the loss fn skips its internal
             # rollout and consumes these directly.
             probe_every = config.train.get('adaptive_weight_probe_every', 0)
-            adaptive_enabled = config.train.get('adaptive_weighting', False)
+            adaptive_enabled = transition_csm and config.train.get('adaptive_weighting', False)
             probe = None
             if transition_csm and adaptive_enabled and probe_every and global_step % probe_every == 0:
                 def probe(csm_norm, ce_norm):
@@ -244,7 +245,7 @@ def main(args):
                 rollout_results = rollout_results,
                 lengths       = lengths,
                 ema_lora      = ema_lora,
-                backward_callback = accelerator.backward if (transition_csm or final_draft_remask) else None,
+                backward_callback = accelerator.backward if (transition_csm or final_draft_remask or macro_remask_csm) else None,
                 gradient_probe_callback = probe,
             )
 

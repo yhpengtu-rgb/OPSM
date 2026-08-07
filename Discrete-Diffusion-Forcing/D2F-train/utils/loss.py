@@ -665,6 +665,123 @@ def compute_transition_csm_loss(
     }
 
 
+def compute_macro_remask_csm_loss(
+    input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
+    enable_shift, eos_id, student_decode_steps=1, temperature=1.0, top_p=0.95,
+    config=None, lengths=None, backward_callback=None,
+):
+    """Concrete score matching on a low-confidence remasked full draft.
+
+    The detached rollout returns successor ``x_s`` and generation-time token
+    confidences. Its low-confidence tokens are remasked to form predecessor
+    ``x_t``. Teacher and EMA-fake scores are evaluated at ``x_s`` and update
+    only student logits evaluated at ``x_t`` on the remasked support.
+    """
+    from utils.on_policy_rollout import student_blockwise_rollout_dmd
+
+    if backward_callback is None:
+        raise ValueError("macro_remask_csm requires a backward callback")
+    B, L = input_ids.shape
+    device = input_ids.device
+    is_llada = config.get('training_mode', 'dream') == 'llada'
+    shift = (not is_llada) and enable_shift
+    full_draft, decoded_positions, _, rollout_confidence = student_blockwise_rollout_dmd(
+        input_ids=input_ids, student_model=denoiser, question_length=question_length,
+        block_size=block_size, num_decode_steps=student_decode_steps, mask_id=mask_id,
+        eos_id=eos_id, temperature=temperature, top_p=top_p, device=device,
+        is_llada=is_llada, shift=shift, lengths=lengths,
+        return_rollout_confidence=True,
+    )
+    if lengths is None:
+        valid_lengths = torch.full((B,), L, device=device, dtype=torch.long)
+    else:
+        valid_lengths = lengths.to(device=device, dtype=torch.long).clamp(0, L)
+    positions = torch.arange(L, device=device).unsqueeze(0)
+    valid_mask = positions < valid_lengths.unsqueeze(1)
+    prompt_lengths = torch.minimum(
+        question_length.to(device=device, dtype=torch.long).clamp(0, L), valid_lengths
+    )
+    answer_mask = (positions >= prompt_lengths.unsqueeze(1)) & valid_mask
+    correction_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+    remask_ratio = config.train.get('macro_remask_ratio', 0.25)
+    for batch_idx in range(B):
+        candidates = torch.nonzero(answer_mask[batch_idx] & full_draft[batch_idx].ne(mask_id), as_tuple=True)[0]
+        if candidates.numel() == 0:
+            continue
+        remask_count = min(candidates.numel(), max(1, int(candidates.numel() * remask_ratio)))
+        selected = torch.topk(rollout_confidence[batch_idx, candidates], remask_count, largest=False).indices
+        correction_mask[batch_idx, candidates[selected]] = True
+
+    predecessor_ids = full_draft.masked_fill(correction_mask, mask_id)
+    successor_ids = full_draft
+    successor_mode = config.train.get('macro_remask_successor', 'full_draft')
+    teacher_mask = torch.zeros([B, 1, L, L], dtype=torch.float16, device=device).masked_fill(
+        ~valid_mask[:, None, None, :], float('-inf')
+    )
+    teacher_kwargs = {'attention_bias': teacher_mask} if is_llada else {'attention_mask': teacher_mask}
+    if successor_mode == 'teacher_corrected':
+        with torch.no_grad():
+            adapter_model = _unwrap_model(denoiser)
+            with adapter_model.disable_adapter():
+                correction_logits = denoiser(predecessor_ids, **teacher_kwargs).logits
+                if shift:
+                    correction_logits = shift_logits(correction_logits)
+                successor_ids = predecessor_ids.clone()
+                successor_ids[correction_mask] = correction_logits[correction_mask].argmax(dim=-1)
+    elif successor_mode != 'full_draft':
+        raise ValueError(f"Unsupported macro_remask_successor: {successor_mode}")
+
+    predecessor_mask = build_custom_float_attention_mask(
+        predecessor_ids, prompt_lengths, block_size, device=device
+    ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+    successor_mask = build_custom_float_attention_mask(
+        successor_ids, prompt_lengths, block_size, device=device
+    ).to(torch.float16).masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+    student_kwargs = {'attention_bias': predecessor_mask} if is_llada else {'attention_mask': predecessor_mask}
+    fake_kwargs = {'attention_bias': successor_mask} if is_llada else {'attention_mask': successor_mask}
+    adapter_model = _unwrap_model(denoiser)
+    with torch.no_grad():
+        with adapter_model.disable_adapter():
+            teacher_logits = denoiser(successor_ids, **teacher_kwargs).logits
+            if shift:
+                teacher_logits = shift_logits(teacher_logits)
+            teacher_selected = teacher_logits[correction_mask].float()
+        with ema_lora.swap(denoiser):
+            fake_logits = denoiser(successor_ids, **fake_kwargs).logits
+            if shift:
+                fake_logits = shift_logits(fake_logits)
+            fake_selected = fake_logits[correction_mask].float()
+
+    student_logits_full = denoiser(predecessor_ids, **student_kwargs).logits
+    if shift:
+        student_logits_full = shift_logits(student_logits_full)
+    if correction_mask.any():
+        student_logits = student_logits_full[correction_mask]
+        student_probs = F.softmax(student_logits.detach(), dim=-1, dtype=torch.float32)
+        fake_score = fake_selected - (student_probs * fake_selected).sum(dim=-1, keepdim=True)
+        teacher_score = teacher_selected - (student_probs * teacher_selected).sum(dim=-1, keepdim=True)
+        grad_coeff = (2.0 * student_probs * (fake_score - teacher_score)).detach()
+        csm_loss = (grad_coeff * student_logits.float()).sum(dim=-1).mean()
+        ce_loss = F.cross_entropy(student_logits, input_ids[correction_mask])
+    else:
+        csm_loss = student_logits_full[0, 0, 0] * 0.0
+        ce_loss = csm_loss
+    ce_weight = config.train.get('macro_remask_gt_ce_weight', 0.0)
+    backward_callback(csm_loss + ce_weight * ce_loss + sum(
+        parameter.reshape(-1)[0] * 0.0 for parameter in denoiser.parameters()
+        if parameter.requires_grad
+    ))
+    return {
+        'loss': (csm_loss.detach() + ce_weight * ce_loss.detach()),
+        'transition_dmd_loss': csm_loss.detach(),
+        'aux_remaining_loss': ce_loss.detach(),
+        'student_decoded_length': decoded_positions.sum().float() / B,
+        'remaining_mask_length': correction_mask.sum().float() / B,
+        'transition_count': torch.tensor(1, device=device),
+        'backward_done': True,
+    }
+
+
 def compute_final_draft_remask_loss(
     input_ids, denoiser, question_length, mask_id, block_size, enable_shift,
     eos_id, student_decode_steps=1, temperature=1.0, top_p=0.95,
@@ -787,6 +904,7 @@ def compute_loss_by_config(
     dmd_loss = config.train.get('dmd_loss', False) if hasattr(config, 'train') else False
     transition_csm = config.train.get('transition_csm', False) if hasattr(config, 'train') else False
     final_draft_remask = config.train.get('final_draft_remask', False) if hasattr(config, 'train') else False
+    macro_remask_csm = config.train.get('macro_remask_csm', False) if hasattr(config, 'train') else False
 
     # LLaDA's mask token id (from config.json) is 126336; the config file's
     # ``denoiser.encoder.mask_id`` is only correct for Dream. Mirror the
@@ -812,6 +930,16 @@ def compute_loss_by_config(
                 temperature=temperature, top_p=top_p, config=config, lengths=lengths,
                 backward_callback=backward_callback,
                 gradient_probe_callback=gradient_probe_callback,
+            )
+
+        if macro_remask_csm:
+            if ema_lora is None:
+                raise ValueError("macro_remask_csm requires ema_lora to be passed to compute_loss_by_config")
+            return compute_macro_remask_csm_loss(
+                input_ids, denoiser, ema_lora, question_length, mask_id, block_size,
+                enable_shift, eos_id, student_decode_steps=student_decode_steps,
+                temperature=temperature, top_p=top_p, config=config, lengths=lengths,
+                backward_callback=backward_callback,
             )
 
         if final_draft_remask:

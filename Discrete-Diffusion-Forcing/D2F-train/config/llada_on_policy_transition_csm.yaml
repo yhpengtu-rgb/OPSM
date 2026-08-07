@@ -28,12 +28,16 @@ denoiser:
 
 train:
   distillation_mode: "on-policy"
-  transition_csm: true
-  # Uniformly sample this fraction of total rollout blocks for CSM; at least one.
-  transition_sample_ratio: 0.1
+  # Full-draft low-confidence remask Concrete Score Matching.
+  transition_csm: false
+  macro_remask_csm: true
+  macro_remask_ratio: 0.25
+  # full_draft uses the student draft as x_s; teacher_corrected is optional.
+  macro_remask_successor: full_draft
+  macro_remask_gt_ce_weight: 0.1
   dmd_loss: false
   dmd_ema_decay: 0.999
-  aux_remaining_weight: 0.1
+  aux_remaining_weight: 0.0
   # Optional low-frequency EMA gradient-norm balancing for auxiliary CE.
   adaptive_weighting: false
   adaptive_weight_probe_every: 100
@@ -42,10 +46,11 @@ train:
   adaptive_weight_update_rate: 0.1
   adaptive_weight_min: 0.01
   adaptive_weight_max: 10.0
-  student_decode_steps: 1
+  # Decode each block fully before constructing the macro transition.
+  student_decode_steps: 16
   teacher_rollout_steps: 1
-  temperature: 0.8
-  top_p: 0.95
+  temperature: 0.0
+  top_p: 1.0
   async_rollout_device:
   decoder_resume_path:
   head_resume_path:
@@ -60,10 +65,10 @@ train:
   report_to: "no"
   block_size: 16
   lr: 1e-5
-  num_iters: 50000
-  num_epochs: 28
+  # num_iters: 50000
+  num_epochs: 3
   eval_every: 100000
-  save_every: 100000
+  save_every: 1000
   enable_shift: true
   share_steps: 2
   self_align: true
